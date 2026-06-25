@@ -4,8 +4,8 @@
   "codeowners": ["@iamacarpet"],
   "config_flow": true,
   "documentation": "https://github.com/iamacarpet/homeassistant_orisec",
-  "issue_tracker": "https://github.com/iamacarpet/homeassistant_orisec/issues",
   "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/iamacarpet/homeassistant_orisec/issues",
   "requirements": [],
   "version": "1.0.0"
 }
