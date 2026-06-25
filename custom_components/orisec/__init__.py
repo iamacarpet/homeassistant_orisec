@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .const import DOMAIN, PLATFORMS, CONF_PANEL_IP, CONF_PANEL_PORT, CONF_PASSWORD
 from .coordinator import OrisecCoordinator
@@ -21,7 +24,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         password=entry.data[CONF_PASSWORD],
     )
 
-    await coordinator.async_setup()
+    try:
+        await coordinator.async_setup()
+    except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
+        raise ConfigEntryNotReady(f"Cannot connect to Orisec panel: {err}") from err
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator

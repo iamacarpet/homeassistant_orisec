@@ -218,7 +218,8 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         try:
-            if not self._conn.connected:
+            if not self.connected:
+                await self._conn.disconnect()
                 await self._conn.connect()
                 await self._do_login()
                 await self._do_config()
@@ -265,9 +266,14 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "rem_output_state": self.rem_output_state,
             }
 
-        except (ConnectionError, OSError, asyncio.TimeoutError) as err:
+        except Exception as err:
             self._stage = 0
-            await self._conn.disconnect()
+            try:
+                await self._conn.disconnect()
+            except Exception:
+                pass
+            if isinstance(err, UpdateFailed):
+                raise
             raise UpdateFailed(f"Communication error: {err}") from err
 
     @callback
@@ -402,6 +408,10 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return "triggered"
         if sos[SOS_ARMED] & bit:
             if sos[SOS_PART_ARMED] & bit:
+                if sos[SOS_PART2] & bit:
+                    return "armed_night"
+                if sos[SOS_PART3] & bit:
+                    return "armed_vacation"
                 return "armed_home"
             return "armed_away"
         if sos[SOS_IN_EXIT] & bit:

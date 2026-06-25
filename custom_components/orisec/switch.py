@@ -42,6 +42,7 @@ async def async_setup_entry(
 class OrisecOutputSwitch(CoordinatorEntity[OrisecCoordinator], SwitchEntity):
 
     _attr_has_entity_name = True
+    _attr_entity_registry_enabled_default = False
 
     def __init__(
         self,
