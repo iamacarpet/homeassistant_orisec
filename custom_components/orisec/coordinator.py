@@ -111,6 +111,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.zone_bypass: bytes = b""
 
         self._prev_alarm_state: dict[int, bool] = {}
+        self._prev_arm_state: dict[int, str] = {}
 
     @property
     def host(self) -> str:
@@ -274,14 +275,15 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         sos = self.sys_output_state
         for area_idx in range(self.max_areas):
             bit = 1 << area_idx
+            area_name = (
+                self.area_names[area_idx]
+                if area_idx < len(self.area_names) and self.area_names[area_idx]
+                else f"Area {area_idx + 1}"
+            )
+
             in_alarm = bool(sos[SOS_ALARM] & bit) or bool(sos[SOS_IN_ALARM] & bit)
-            prev = self._prev_alarm_state.get(area_idx, False)
-            if in_alarm and not prev:
-                area_name = (
-                    self.area_names[area_idx]
-                    if area_idx < len(self.area_names) and self.area_names[area_idx]
-                    else f"Area {area_idx + 1}"
-                )
+            prev_alarm = self._prev_alarm_state.get(area_idx, False)
+            if in_alarm and not prev_alarm:
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_alarm_triggered",
                     {
@@ -292,7 +294,29 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "bell": bool(sos[SOS_BELL] & bit),
                     },
                 )
+            elif prev_alarm and not in_alarm:
+                self.hass.bus.async_fire(
+                    f"{DOMAIN}_alarm_cleared",
+                    {
+                        "area": area_idx + 1,
+                        "area_name": area_name,
+                    },
+                )
             self._prev_alarm_state[area_idx] = in_alarm
+
+            current_state = self.get_alarm_state_for_area(area_idx)
+            prev_state = self._prev_arm_state.get(area_idx)
+            if prev_state is not None and current_state != prev_state:
+                self.hass.bus.async_fire(
+                    f"{DOMAIN}_state_changed",
+                    {
+                        "area": area_idx + 1,
+                        "area_name": area_name,
+                        "old_state": prev_state,
+                        "new_state": current_state,
+                    },
+                )
+            self._prev_arm_state[area_idx] = current_state
 
     async def async_send_keypress(self, key_code: int, area_mask: int) -> None:
         if not self._conn.connected:
