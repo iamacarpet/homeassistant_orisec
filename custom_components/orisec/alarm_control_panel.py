@@ -202,6 +202,16 @@ class OrisecPartArmPanel(CoordinatorEntity[OrisecCoordinator], AlarmControlPanel
             return AlarmControlPanelState.PENDING
         return AlarmControlPanelState.DISARMED
 
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        active_part = self.coordinator.get_active_part_arm(self._area_idx)
+        if active_part == self._part:
+            self._attr_alarm_state = AlarmControlPanelState.ARMED_HOME
+        else:
+            base = self.coordinator.get_alarm_state_for_area(self._area_idx)
+            self._attr_alarm_state = _STATE_MAP.get(base, AlarmControlPanelState.DISARMED)
+        self.async_write_ha_state()
+
     async def async_alarm_arm_home(self, code: str | None = None) -> None:
         area_mask = 1 << self._area_idx
         await self.coordinator.async_arm_home(area_mask, part=self._part)

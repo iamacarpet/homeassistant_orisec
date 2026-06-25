@@ -6,6 +6,7 @@ import logging
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -22,17 +23,15 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: OrisecCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities: list[SensorEntity] = [
-        OrisecConnectionSensor(coordinator, entry),
-    ]
-    async_add_entities(entities)
+    async_add_entities([OrisecPanelInfoSensor(coordinator, entry)])
 
 
-class OrisecConnectionSensor(CoordinatorEntity[OrisecCoordinator], SensorEntity):
+class OrisecPanelInfoSensor(CoordinatorEntity[OrisecCoordinator], SensorEntity):
 
     _attr_has_entity_name = True
-    _attr_name = "Panel Status"
+    _attr_name = "Panel Info"
     _attr_icon = "mdi:shield-home"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(
         self,
@@ -54,17 +53,16 @@ class OrisecConnectionSensor(CoordinatorEntity[OrisecCoordinator], SensorEntity)
 
     @property
     def native_value(self) -> str:
-        if self.coordinator.connected:
-            return "online"
-        return "offline"
+        return "online" if self.coordinator.connected else "offline"
 
     @property
     def extra_state_attributes(self):
         sos = self.coordinator.sys_output_state
         attrs = {
+            "serial": self.coordinator.serial,
             "panel_type": self.coordinator.panel_type,
             "panel_version": self.coordinator.panel_version,
-            "serial": self.coordinator.serial,
+            "host": self.coordinator.host,
             "max_zones": self.coordinator.max_zones,
             "max_areas": self.coordinator.max_areas,
             "max_remote_outputs": self.coordinator.max_rem_outputs,
@@ -73,8 +71,17 @@ class OrisecConnectionSensor(CoordinatorEntity[OrisecCoordinator], SensorEntity)
             "trouble": bool(sos[SOS_TROUBLE] & 0xFF) if sos else False,
             "engineer_required": bool(sos[SOS_CALL_ENGINEER] & 0xFF) if sos else False,
         }
-        if self.coordinator.part_arm_names:
-            for i, name in enumerate(self.coordinator.part_arm_names):
+
+        if self.coordinator.area_names:
+            for i, name in enumerate(self.coordinator.area_names):
                 if name:
-                    attrs[f"part_arm_{i + 1}_name"] = name
+                    state = self.coordinator.get_alarm_state_for_area(i)
+                    attrs[f"area_{i + 1}_name"] = name
+                    attrs[f"area_{i + 1}_state"] = state
+
+        if self.coordinator.part_arm_names:
+            attrs["part_arm_names"] = [
+                n for n in self.coordinator.part_arm_names if n
+            ]
+
         return attrs

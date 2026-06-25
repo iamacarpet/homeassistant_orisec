@@ -162,9 +162,9 @@ ZONE_TYPE_NAMES: dict[int, str] = {
 }
 
 ZONE_TYPE_TO_DEVICE_CLASS: dict[int, str] = {
-    1: "opening",
-    2: "opening",
-    3: "opening",
+    1: "motion",
+    2: "motion",
+    3: "motion",
     4: "motion",
     5: "door",
     6: "smoke",

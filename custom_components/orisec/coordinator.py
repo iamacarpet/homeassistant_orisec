@@ -37,6 +37,8 @@ from .const import (
     SOS_BELL,
     SOS_FIRE,
     SOS_IN_ALARM,
+    SOS_IN_ENTRY,
+    SOS_IN_EXIT,
     SOS_PA,
     SOS_PART_ARMED,
     SOS_PART1,
@@ -327,6 +329,11 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_shutdown(self) -> None:
         await self._conn.disconnect()
         self._stage = 0
+
+    def get_zone_bypass(self, zone_index: int) -> bool:
+        if not self.zone_bypass or zone_index >= len(self.zone_bypass):
+            return False
+        return bool(self.zone_bypass[zone_index])
 
     def get_zone_type(self, zone_index: int) -> int:
         if zone_index < len(self.zone_types):
