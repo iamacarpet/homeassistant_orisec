@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Orisec ControlPlus2",
+        "description": "Connect to your Orisec alarm panel over the local network.",
+        "data": {
+          "host": "Panel IP Address",
+          "port": "Panel Port",
+          "password": "Panel Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Unable to connect to the panel. Check the IP address and port.",
+      "invalid_auth": "Invalid password. Please check your panel password.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This panel is already configured."
+    }
+  }
+}
