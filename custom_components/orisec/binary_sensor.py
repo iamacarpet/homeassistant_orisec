@@ -52,7 +52,7 @@ _SYSTEM_SENSORS: list[
     ("battery_fault", SOS_BATTERY_FAULT, BinarySensorDeviceClass.BATTERY, "Battery Fault", None),
     ("tamper", SOS_TAMPER, BinarySensorDeviceClass.TAMPER, "Tamper", None),
     ("bell", SOS_BELL, BinarySensorDeviceClass.SOUND, "Bell Active", None),
-    ("trouble", SOS_TROUBLE, BinarySensorDeviceClass.PROBLEM, "Trouble", EntityCategory.DIAGNOSTIC),
+    ("trouble", SOS_TROUBLE, BinarySensorDeviceClass.PROBLEM, "Trouble", None),
 ]
 
 
