@@ -66,7 +66,10 @@ class OrisecAlarmPanel(CoordinatorEntity[OrisecCoordinator], AlarmControlPanelEn
             if area_idx < len(coordinator.area_names) and coordinator.area_names[area_idx]
             else f"Area {area_idx + 1}"
         )
-        self._attr_name = area_name
+        if coordinator.max_areas > 1:
+            self._attr_name = f"{area_name} Alarm"
+        else:
+            self._attr_name = "Alarm"
         self._attr_unique_id = f"{entry.entry_id}_alarm_area_{area_idx + 1}"
 
         # Full Set is always available; part arms depend on panel configuration.
@@ -88,6 +91,7 @@ class OrisecAlarmPanel(CoordinatorEntity[OrisecCoordinator], AlarmControlPanelEn
             "manufacturer": "Orisec",
             "model": self.coordinator.panel_type,
             "sw_version": self.coordinator.panel_version,
+            "configuration_url": "/orisec",
         }
 
     @property

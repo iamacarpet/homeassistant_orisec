@@ -7,6 +7,7 @@ Communicates directly with the panel over UDP on port 20202 — no cloud, no int
 ## Features
 
 - **Alarm control** — Full Set, Part Set (1/2/3), and Disarm per area, with the panel's own arm-mode names
+- **Virtual keypad** — Real-time LCD display emulation and full 24-button keypad via a dedicated sidebar panel
 - **Part-arm modes** — Up to 3 part-arm modes (Home/Night/Vacation) driven by the panel's own programmed names
 - **Zone sensors** — Binary sensors for every configured zone with auto-assigned device classes
 - **System sensors** — AC power, battery fault, tamper, bell active, and trouble indicators
@@ -16,7 +17,8 @@ Communicates directly with the panel over UDP on port 20202 — no cloud, no int
 - **Alarm events** — Fires `orisec_alarm_triggered` / `orisec_alarm_cleared` / `orisec_state_changed` on the HA event bus
 - **Fast polling** — 2-second update interval via lightweight UDP packets
 - **Auto-reconnect** — If communication fails, the integration reconnects automatically on the next poll
-- **Custom Lovelace card** — `orisec-alarm-panel-card` auto-registered; shows your panel's arm-mode names instead of the HA defaults (Away/Home/Night/Vacation)
+- **Custom Lovelace cards** — `orisec-alarm-panel-card` and `orisec-keypad-card` auto-registered; shows your panel's arm-mode names
+- **Sidebar panel** — Auto-registered "Orisec" sidebar item with alarm controls and keypad in one page
 
 ## Supported Panels
 
@@ -69,11 +71,11 @@ The integration validates credentials during setup and raises a clear error if t
 
 ### Alarm Control Panel
 
-One entity is created per area. It appears in the **Security** section of the HA dashboard automatically.
+One entity per area named "Alarm" (or "{area_name} Alarm" for multi-area panels). It appears in the **Security** section of the HA dashboard automatically.
 
 | Entity | Description |
 |--------|-------------|
-| `alarm_control_panel.{area_name}` | Alarm control for the area |
+| `alarm_control_panel.alarm` | Alarm control for the area |
 
 **Supported arm modes** (shown as buttons in the alarm card):
 
@@ -131,19 +133,43 @@ Remote outputs (labelled "Remote 1–5" if unnamed) are the panel's relay output
 
 **Attributes:** `panel_type`, `panel_version`, `serial`, `host`, `max_zones`, `max_areas`, `max_remote_outputs`, `part_arm_mask`, `ac_power`, `trouble`, `engineer_required`, `area_N_state`, `area_N_name`, `part_arm_names`
 
-## Custom Lovelace Card
+## Custom Lovelace Cards
 
-The integration auto-registers `orisec-alarm-panel-card` — a Lovelace card that replaces HA's generic "Away / Home / Night / Vacation" button labels with the names programmed into your panel.
+The integration auto-registers two custom Lovelace cards.
 
-Add it to a dashboard with:
+### Alarm Panel Card
+
+Replaces HA's generic "Away / Home / Night / Vacation" button labels with the names programmed into your panel.
 
 ```yaml
 type: custom:orisec-alarm-panel-card
-entity: alarm_control_panel.home
+entity: alarm_control_panel.alarm
 name: My Alarm   # optional
 ```
 
 The card shows the current state (Disarmed / Full Set / Set – {name} / Setting… / Entry delay… / Alarm!) with a colour-coded badge and blinking animation for active states.
+
+### Keypad Card
+
+A virtual keypad with live LCD display. Can be added to any dashboard.
+
+```yaml
+type: custom:orisec-keypad-card
+name: Panel Keypad   # optional
+```
+
+The card auto-discovers the panel entry and provides a 4-line LCD display (updated every 2 seconds) with the full 24-button keypad layout matching the physical panel: digits 0–9, Fire, PA, Accept, Yes, No, Omit, Clear, Reset, and arrow navigation.
+
+LCD polling only activates while the card is visible and stops automatically when you navigate away.
+
+## Sidebar Panel
+
+The integration registers an **Orisec** item in the HA sidebar automatically on setup. This provides a dedicated full-page interface combining:
+
+- **Alarm status** — current arm state, ready/trouble/bypass indicators, arm/disarm buttons
+- **Virtual keypad** — live LCD display and full button grid
+
+Access it from the sidebar or via the "Visit" link on the device page in Settings → Devices & Services.
 
 ## Events
 
@@ -215,7 +241,7 @@ automation:
     action:
       - service: alarm_control_panel.alarm_arm_home
         target:
-          entity_id: alarm_control_panel.home
+          entity_id: alarm_control_panel.alarm
 ```
 
 ### Notify on arm state change
@@ -246,7 +272,7 @@ automation:
         to: "on"
     condition:
       - condition: state
-        entity_id: alarm_control_panel.home
+        entity_id: alarm_control_panel.alarm
         state: "disarmed"
     action:
       - service: light.turn_on
@@ -293,6 +319,8 @@ All communication is local UDP. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for ful
 | Arm command ignored | Your user PIN may not have access to that area. Check `user_area` in panel diagnostics. |
 | Remote outputs not visible | Switches are disabled by default. Enable them in **Settings → Devices & Services → Entities**. |
 | Card shows "Away/Home" labels | Use `custom:orisec-alarm-panel-card` instead of the built-in `alarm-panel` card. |
+| Keypad LCD is blank | LCD only updates while the keypad card/panel is visible. Open the sidebar panel or add the keypad card to a dashboard. |
+| Sidebar item missing | Reload the integration or restart HA. The "Orisec" sidebar item registers on first setup. |
 
 ## Documentation
 

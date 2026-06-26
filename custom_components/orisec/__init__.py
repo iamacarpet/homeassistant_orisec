@@ -10,6 +10,7 @@ import voluptuous as vol
 
 from homeassistant.components import frontend, websocket_api
 from homeassistant.components.http import StaticPathConfig
+from homeassistant.components.panel_custom import async_register_panel
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
@@ -33,6 +34,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         frontend.add_extra_js_url(hass, _CARD_URL)
         frontend.add_extra_js_url(hass, _KEYPAD_CARD_URL)
         hass.data[f"{DOMAIN}_card_loaded"] = True
+
+    if not hass.data.get(f"{DOMAIN}_panel_registered"):
+        await async_register_panel(
+            hass,
+            frontend_url_path="orisec",
+            webcomponent_name="orisec-panel",
+            sidebar_title="Orisec",
+            sidebar_icon="mdi:shield-home",
+            module_url="/orisec_panel/orisec-panel.js",
+            embed_iframe=False,
+            require_admin=False,
+        )
+        hass.data[f"{DOMAIN}_panel_registered"] = True
 
     if not hass.data.get(f"{DOMAIN}_ws_registered"):
         websocket_api.async_register_command(hass, ws_handle_keypad_subscribe)
