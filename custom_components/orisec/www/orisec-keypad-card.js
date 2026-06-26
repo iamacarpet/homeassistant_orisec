@@ -48,6 +48,12 @@ const PX_PER_UNIT = LCD_W / LCD_UNITS;
 const LCD_FONT = "'Courier New','Lucida Console',monospace";
 const LCD_ICON_FONT = "'OrisecV4','Courier New',monospace";
 
+let _iconFontLoaded = false;
+if (!document.fonts || !Array.from(document.fonts).some(f => f.family === "OrisecV4")) {
+  const face = new FontFace("OrisecV4", "url(/orisec_panel/orisecV4.ttf)");
+  face.load().then(f => { document.fonts.add(f); _iconFontLoaded = true; }).catch(() => {});
+}
+
 function lcdFont(px, bold, isIcon) {
   const family = isIcon ? LCD_ICON_FONT : LCD_FONT;
   return (bold ? "bold " : "") + px + "px " + family;
@@ -177,14 +183,21 @@ function renderLcd(canvas, raw, time) {
       const chars = s.chars;
       if (!chars || chars.length === 0) continue;
 
-      let wUnits = 0;
-      for (const c of chars) wUnits += FONT_MULT[c.fs || 0];
+      const widths = [];
+      let totalMeasured = 0;
+      for (const c of chars) {
+        const px = c.icon ? 18 : FONT_PX[c.fs || 0];
+        ctx.font = lcdFont(px, c.inv, c.icon);
+        const mw = ctx.measureText(c.ch).width;
+        widths.push(mw);
+        totalMeasured += mw;
+      }
 
       let xPx;
       if (s.align === "center") {
-        xPx = (LCD_W - wUnits * PX_PER_UNIT) / 2;
+        xPx = (LCD_W - totalMeasured) / 2;
       } else if (s.align === "right") {
-        xPx = LCD_W - wUnits * PX_PER_UNIT - 4 * PX_PER_UNIT;
+        xPx = LCD_W - totalMeasured - 4 * PX_PER_UNIT;
       } else {
         xPx = s.x * PX_PER_UNIT;
       }
@@ -192,36 +205,30 @@ function renderLcd(canvas, raw, time) {
       ctx.textBaseline = "middle";
 
       ctx.fillStyle = LCD_BG;
-      ctx.fillRect(xPx, y - LCD_LINE_H / 2, wUnits * PX_PER_UNIT, LCD_LINE_H);
+      ctx.fillRect(xPx, y - LCD_LINE_H / 2, totalMeasured + 2, LCD_LINE_H);
 
-      for (const c of chars) {
-        const cw = FONT_MULT[c.fs || 0] * PX_PER_UNIT;
+      for (let ci = 0; ci < chars.length; ci++) {
+        const c = chars[ci];
+        const mw = widths[ci];
         const px = c.icon ? 18 : FONT_PX[c.fs || 0];
         ctx.font = lcdFont(px, c.inv, c.icon);
 
         if (c.inv) {
           ctx.fillStyle = LCD_INV_BG;
-          ctx.fillRect(xPx, y - LCD_LINE_H / 2 + 2, cw, LCD_LINE_H - 4);
+          ctx.fillRect(xPx, y - LCD_LINE_H / 2 + 2, mw + 1, LCD_LINE_H - 4);
           ctx.fillStyle = LCD_INV_FG;
         } else {
           ctx.fillStyle = LCD_FG;
         }
 
-        const mw = ctx.measureText(c.ch).width;
-        ctx.fillText(c.ch, xPx + (cw - mw) / 2, y);
-        xPx += cw;
+        ctx.fillText(c.ch, xPx, y);
+        xPx += mw;
       }
     }
   }
 }
 
 const STYLES = `
-  @font-face {
-    font-family: 'OrisecV4';
-    src: url('/orisec_panel/orisecV4.ttf') format('truetype');
-    font-display: block;
-  }
-
   :host { display: block; }
   ha-card { overflow: hidden; }
 
