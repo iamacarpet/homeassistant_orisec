@@ -42,14 +42,23 @@ const ICON_MAP = {
   165: "\u25B6", 166: "\u25C0", 170: "\u2731", 172: "\u25BC", 173: "\u25B2",
 };
 
-const LCD_WIDTH = 320;
-const LCD_HEIGHT = 96;
-const LCD_LINE_H = 24;
-const LCD_FONT = "14px 'Courier New', 'Lucida Console', monospace";
+// Display is 128 units wide. Character widths per font size index:
+const FONT_MULTIPLIER = [7.0, 4.5, 4.5, 4.9];
+// Map font size index to pixel font size for canvas rendering:
+const FONT_SIZES = [20, 20, 20, 14];
+
+const LCD_WIDTH = 380;
+const LCD_HEIGHT = 112;
+const LCD_LINE_H = 28;
 const LCD_BG = "#001832";
 const LCD_FG = "#e0e0e0";
 const LCD_INV_BG = "#e0e0e0";
-const LCD_INV_FG = "#001832";
+const LCD_INV_FG = "#102040";
+const LCD_UNITS = 128;
+
+function lcdFont(size, bold) {
+  return (bold ? "bold " : "") + size + "px 'Courier New', 'Lucida Console', monospace";
+}
 
 function renderLcd(canvas, raw, time) {
   const ctx = canvas.getContext("2d");
@@ -62,15 +71,17 @@ function renderLcd(canvas, raw, time) {
 
   ctx.fillStyle = LCD_BG;
   ctx.fillRect(0, 0, LCD_WIDTH, LCD_HEIGHT);
-  ctx.font = LCD_FONT;
-  ctx.textBaseline = "middle";
 
   if (!raw || raw.length === 0) return;
 
+  // Parse raw bytes into line segment arrays
+  // Each segment: { ch, inv, fontSize } or { progress, value, max }
   const lines = [[], [], [], []];
   const lineAligns = ["left", "left", "left", "left"];
+  const linePadX = [null, null, null, null]; // explicit X position from byte 8
   let cur = -1;
   let inverted = false;
+  let fontSize = 0;
 
   let i = 0;
   while (i < raw.length) {
@@ -79,16 +90,27 @@ function renderLcd(canvas, raw, time) {
       cur = cur === -1 ? 0 : Math.min(cur + 1, 3);
       lines[cur] = [];
       lineAligns[cur] = "left";
+      linePadX[cur] = null;
       inverted = false;
+      fontSize = 0;
     } else if (b >= 18 && b <= 21) {
       cur = b - 18;
       lines[cur] = [];
       lineAligns[cur] = "left";
+      linePadX[cur] = null;
       inverted = false;
+      fontSize = 0;
     } else if (b === 5) {
       inverted = false;
     } else if (b === 6) {
       inverted = true;
+    } else if (b === 8 && i + 1 < raw.length) {
+      // Pad right: position X at (padRight / 128) * width
+      i++;
+      if (cur >= 0) linePadX[cur] = raw[i];
+    } else if (b === 9) {
+      // Reset X to origin
+      if (cur >= 0) linePadX[cur] = 0;
     } else if (b === 10 && cur >= 0) {
       lineAligns[cur] = "center";
     } else if (b === 11 && cur >= 0) {
@@ -98,27 +120,36 @@ function renderLcd(canvas, raw, time) {
                  (time[1] < 10 ? "0" : "") + time[1] + "." +
                  (time[2] < 10 ? "0" : "") + time[2];
       for (let c = 0; c < ts.length; c++) {
-        lines[cur].push({ ch: ts[c], inv: inverted });
+        lines[cur].push({ ch: ts[c], inv: inverted, fs: fontSize });
       }
     } else if (b === 14) {
-      if (cur >= 0 && i + 4 < raw.length) {
-        const pVal = raw[i + 1];
-        const pMax = raw[i + 2] || 1;
-        lines[cur].push({ progress: true, value: pVal, max: pMax, inv: inverted });
+      // Progress bar: 3 param bytes (width, max, current)
+      if (cur >= 0 && i + 3 < raw.length) {
+        lines[cur].push({
+          progress: true,
+          value: raw[i + 3],
+          max: raw[i + 2] || 1,
+          barWidth: raw[i + 1],
+        });
       }
-      i += 4;
-    } else if (b === 7 || b === 8 || b === 16 || b === 26) {
-      i++;
+      i += 3;
+    } else if (b === 7 || b === 16) {
+      i++; // skip 1 param byte
+    } else if (b === 26) {
+      i++; // skip 1 param byte (icon flag)
     } else if (b >= 22 && b <= 25) {
-      // font size markers — ignore
+      fontSize = b - 22;
     } else if (b >= 32 && b <= 125 && cur >= 0) {
-      lines[cur].push({ ch: String.fromCharCode(b), inv: inverted });
+      lines[cur].push({ ch: String.fromCharCode(b), inv: inverted, fs: fontSize });
     } else if (b > 126 && b <= 173 && cur >= 0) {
       const icon = ICON_MAP[b];
-      if (icon) lines[cur].push({ ch: icon, inv: inverted });
+      if (icon) lines[cur].push({ ch: icon, inv: inverted, fs: fontSize, isIcon: true });
     }
     i++;
   }
+
+  // Render each line
+  const pxPerUnit = LCD_WIDTH / LCD_UNITS;
 
   for (let line = 0; line < 4; line++) {
     const segments = lines[line];
@@ -129,57 +160,64 @@ function renderLcd(canvas, raw, time) {
 
     if (hasProgress) {
       const s = hasProgress;
-      const barW = LCD_WIDTH - 16;
-      const barH = 8;
+      const barW = (s.barWidth || 100) * pxPerUnit;
+      const barH = 10;
+      const barX = (LCD_WIDTH - barW) / 2;
       const barY = y - barH / 2;
       ctx.strokeStyle = LCD_FG;
       ctx.lineWidth = 1;
-      ctx.strokeRect(8, barY, barW, barH);
+      ctx.strokeRect(barX, barY, barW, barH);
       const fill = Math.min(s.value / (s.max || 1), 1) * barW;
       ctx.fillStyle = LCD_FG;
-      ctx.fillRect(8, barY, fill, barH);
+      ctx.fillRect(barX, barY, fill, barH);
       continue;
     }
 
-    const text = segments.map(s => s.ch).join("");
-    const textW = ctx.measureText(text).width;
-    let x = 8;
-    if (lineAligns[line] === "center") {
-      x = (LCD_WIDTH - textW) / 2;
+    // Calculate total width in display units
+    let totalUnits = 0;
+    for (const seg of segments) {
+      totalUnits += FONT_MULTIPLIER[seg.fs || 0];
+    }
+
+    // Determine starting X position in pixels
+    let startX;
+    if (linePadX[line] !== null) {
+      startX = linePadX[line] * pxPerUnit;
+    } else if (lineAligns[line] === "center") {
+      startX = (LCD_WIDTH - totalUnits * pxPerUnit) / 2;
     } else if (lineAligns[line] === "right") {
-      x = LCD_WIDTH - textW - 8;
+      startX = LCD_WIDTH - totalUnits * pxPerUnit - 4 * pxPerUnit;
+    } else {
+      startX = 2 * pxPerUnit;
     }
 
-    let currentInv = null;
-    let run = "";
-    let runX = x;
-
-    function flushRun(inv) {
-      if (!run) return;
-      const rw = ctx.measureText(run).width;
-      if (inv) {
-        ctx.fillStyle = LCD_INV_BG;
-        ctx.fillRect(runX, y - LCD_LINE_H / 2 + 2, rw, LCD_LINE_H - 4);
-        ctx.fillStyle = LCD_INV_FG;
-        ctx.font = "bold " + LCD_FONT;
-      } else {
-        ctx.fillStyle = LCD_FG;
-        ctx.font = LCD_FONT;
-      }
-      ctx.fillText(run, runX, y);
-      if (inv) ctx.font = LCD_FONT;
-      run = "";
-    }
+    // Draw segments character by character
+    let xPos = startX;
+    ctx.textBaseline = "middle";
 
     for (const seg of segments) {
-      if (seg.inv !== currentInv) {
-        flushRun(currentInv);
-        currentInv = seg.inv;
-        runX = x + ctx.measureText(text.substring(0, segments.indexOf(seg))).width;
+      const fs = seg.fs || 0;
+      const charW = FONT_MULTIPLIER[fs] * pxPerUnit;
+      const pxSize = FONT_SIZES[fs];
+      const font = lcdFont(pxSize, seg.inv);
+
+      ctx.font = font;
+
+      if (seg.inv) {
+        ctx.fillStyle = LCD_INV_BG;
+        ctx.fillRect(xPos, y - LCD_LINE_H / 2 + 2, charW, LCD_LINE_H - 4);
+        ctx.fillStyle = LCD_INV_FG;
+      } else {
+        ctx.fillStyle = LCD_FG;
       }
-      run += seg.ch;
+
+      // Center character within its cell
+      const measured = ctx.measureText(seg.ch).width;
+      const charX = xPos + (charW - measured) / 2;
+      ctx.fillText(seg.ch, charX, y);
+
+      xPos += charW;
     }
-    flushRun(currentInv);
   }
 }
 
@@ -314,16 +352,19 @@ const PANEL_STYLES = `
   .lcd-container {
     position: relative;
     margin-bottom: 12px;
+    height: 116px;
+    max-width: 384px;
+    margin-left: auto;
+    margin-right: auto;
   }
   .lcd-canvas {
     display: block;
     width: 100%;
-    max-width: 320px;
-    margin: 0 auto;
+    height: 100%;
     border-radius: 8px;
     border: 2px solid #003060;
     box-shadow: inset 0 0 20px rgba(0,24,50,0.6);
-    background: #001832;
+    background: ${LCD_BG};
   }
   .lcd-overlay {
     position: absolute;
@@ -331,19 +372,17 @@ const PANEL_STYLES = `
     display: flex;
     align-items: center;
     justify-content: center;
-    background: #001832;
+    background: ${LCD_BG};
     border-radius: 8px;
     border: 2px solid #003060;
     cursor: pointer;
     transition: filter 0.15s;
-    max-width: 320px;
-    margin: 0 auto;
   }
   .lcd-overlay:hover { filter: brightness(1.1); }
   .lcd-overlay-text {
     color: #a0e8a0;
     font-family: "Courier New", monospace;
-    font-size: 14px;
+    font-size: 16px;
     text-align: center;
   }
   .lcd-loading {
@@ -352,16 +391,14 @@ const PANEL_STYLES = `
     display: flex;
     align-items: center;
     justify-content: center;
-    background: #001832;
+    background: ${LCD_BG};
     border-radius: 8px;
     border: 2px solid #003060;
-    max-width: 320px;
-    margin: 0 auto;
   }
   .lcd-loading-text {
     color: #a0e8a0;
     font-family: "Courier New", monospace;
-    font-size: 14px;
+    font-size: 16px;
     animation: blink-text 1.2s ease-in-out infinite;
   }
   @keyframes blink-text { 0%,100% { opacity:1 } 50% { opacity:0.3 } }
@@ -609,7 +646,7 @@ class OrisecPanel extends HTMLElement {
         <div class="section" id="keypad-section">
           <div class="section-header">Keypad</div>
           <div class="lcd-container" id="lcd-container">
-            <canvas class="lcd-canvas" id="lcd-canvas" width="320" height="96"></canvas>
+            <canvas class="lcd-canvas" id="lcd-canvas"></canvas>
             <div class="lcd-overlay" id="lcd-overlay">
               <div class="lcd-overlay-text">Click to connect keypad</div>
             </div>
@@ -747,18 +784,19 @@ class OrisecPanel extends HTMLElement {
     const controls = this.shadowRoot.getElementById("keypad-controls");
     const grid = this.shadowRoot.getElementById("keypad-grid");
     const container = this.shadowRoot.getElementById("lcd-container");
-
     const existingLoading = container.querySelector(".lcd-loading");
 
     if (!this._keypadConnected && !this._keypadLoading) {
+      // Disconnected state: show overlay, hide everything else
       overlay.style.display = "flex";
+      canvas.style.visibility = "hidden";
       if (existingLoading) existingLoading.remove();
-      canvas.style.display = "none";
       controls.style.display = "none";
       grid.style.display = "none";
     } else if (this._keypadLoading && !this._lcdRaw) {
+      // Loading state: show loading message
       overlay.style.display = "none";
-      canvas.style.display = "none";
+      canvas.style.visibility = "hidden";
       controls.style.display = "none";
       grid.style.display = "none";
       if (!existingLoading) {
@@ -768,9 +806,10 @@ class OrisecPanel extends HTMLElement {
         container.appendChild(loading);
       }
     } else {
+      // Connected state: show canvas and keypad
       overlay.style.display = "none";
+      canvas.style.visibility = "visible";
       if (existingLoading) existingLoading.remove();
-      canvas.style.display = "block";
       controls.style.display = "flex";
       grid.style.display = "grid";
     }
