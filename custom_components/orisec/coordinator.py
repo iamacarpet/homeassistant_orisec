@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
@@ -13,11 +14,15 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import (
     DOMAIN,
     POLL_INTERVAL,
+    CMD_LCD,
     QUERY_AREA_ARM_ATT,
     QUERY_AREA_TEXTS,
     QUERY_MAX_AREAS,
     QUERY_MAX_REM_OUTPUTS,
     QUERY_MAX_ZONES,
+    QUERY_PANEL_TIME_H,
+    QUERY_PANEL_TIME_M,
+    QUERY_PANEL_TIME_S,
     QUERY_PART_ARM_TEXTS,
     QUERY_REM_OUTPUT_STATE,
     QUERY_REM_OUTPUT_TEXTS,
@@ -112,6 +117,11 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._prev_alarm_state: dict[int, bool] = {}
         self._prev_arm_state: dict[int, str] = {}
+
+        self._keypad_subscribers: int = 0
+        self._lcd_lines: list[str] = ["", "", "", ""]
+        self._panel_time: list[int] = [0, 0, 0]
+        self._lcd_callbacks: list[Callable] = []
 
     @property
     def host(self) -> str:
@@ -242,6 +252,14 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     (QUERY_REM_OUTPUT_STATE, 1, self.max_rem_outputs + 1)
                 )
 
+            if self._keypad_subscribers > 0:
+                queries.extend([
+                    (QUERY_PANEL_TIME_H, 1, 1),
+                    (QUERY_PANEL_TIME_M, 1, 1),
+                    (QUERY_PANEL_TIME_S, 1, 1),
+                    (CMD_LCD, 1, 1),
+                ])
+
             self._poll_index += 1
 
             result = await self._conn.multi_query(queries)
@@ -255,6 +273,15 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.zone_bypass = result.zone_bypass
             if result.rem_output_state:
                 self.rem_output_state = result.rem_output_state
+
+            if self._keypad_subscribers > 0 and result.lcd_raw:
+                self._panel_time = result.panel_time[:]
+                new_lines = self._parse_lcd_text(
+                    result.lcd_raw, self._panel_time
+                )
+                if new_lines != self._lcd_lines:
+                    self._lcd_lines = new_lines
+                    self._notify_lcd_subscribers()
 
             self._check_alarm_events()
 
@@ -436,3 +463,82 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def is_area_ready(self, area_idx: int) -> bool:
         from .const import SOS_READY
         return bool(self.sys_output_state[SOS_READY] & (1 << area_idx))
+
+    # ── Keypad / LCD ────────────────────────────────────────────────────────
+
+    _VALID_KEYPAD_CHARS = frozenset("0123456789FPAYNOCRludr ")
+
+    def keypad_subscribe(self, send_callback: Callable) -> Callable:
+        self._keypad_subscribers += 1
+        self._lcd_callbacks.append(send_callback)
+        send_callback(self._get_lcd_state())
+
+        def unsubscribe() -> None:
+            self._keypad_subscribers = max(0, self._keypad_subscribers - 1)
+            if send_callback in self._lcd_callbacks:
+                self._lcd_callbacks.remove(send_callback)
+
+        return unsubscribe
+
+    def _get_lcd_state(self) -> dict:
+        return {
+            "lines": self._lcd_lines[:],
+            "time": (
+                f"{self._panel_time[0]:02d}:"
+                f"{self._panel_time[1]:02d}:"
+                f"{self._panel_time[2]:02d}"
+            ),
+        }
+
+    @callback
+    def _notify_lcd_subscribers(self) -> None:
+        state = self._get_lcd_state()
+        for cb in self._lcd_callbacks[:]:
+            try:
+                cb(state)
+            except Exception:
+                _LOGGER.debug("Error notifying LCD subscriber", exc_info=True)
+
+    async def async_send_keypad_char(self, char: str) -> None:
+        if not self._conn.connected:
+            raise ConnectionError("Not connected to panel")
+        if len(char) != 1 or char not in self._VALID_KEYPAD_CHARS:
+            raise ValueError(f"Invalid keypad character: {char!r}")
+        await self._conn.send_keypad_char(char)
+        if self._keypad_subscribers > 0:
+            await self.async_request_refresh()
+
+    @staticmethod
+    def _parse_lcd_text(raw: bytes, panel_time: list[int]) -> list[str]:
+        lines: list[str] = ["", "", "", ""]
+        cur = -1
+        i = 0
+        while i < len(raw):
+            b = raw[i]
+            if b == 17:
+                cur = 0 if cur == -1 else min(cur + 1, 3)
+                lines[cur] = ""
+            elif 18 <= b <= 21:
+                cur = b - 18
+                lines[cur] = ""
+            elif b == 12:
+                if cur >= 0:
+                    lines[cur] += (
+                        f"{panel_time[0]:02d}:{panel_time[1]:02d}"
+                        f".{panel_time[2]:02d}"
+                    )
+            elif b == 14:
+                i = min(i + 4, len(raw) - 1)
+            elif b in (7, 8, 16, 26):
+                i = min(i + 1, len(raw) - 1)
+            elif 32 <= b <= 126 and cur >= 0:
+                lines[cur] += chr(b)
+            elif 126 < b <= 173 and cur >= 0:
+                _ICON_MAP = {
+                    127: "<", 128: "E", 155: ":", 156: ".",
+                    159: "[x]", 160: "[ ]", 163: "^", 164: "v",
+                    165: ">", 166: "<", 170: "*", 172: "v", 173: "^",
+                }
+                lines[cur] += _ICON_MAP.get(b, "")
+            i += 1
+        return [line.rstrip() for line in lines]

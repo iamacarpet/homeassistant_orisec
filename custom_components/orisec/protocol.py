@@ -11,7 +11,9 @@ from typing import Any
 from .const import (
     CMD_CONTROL_OUTPUT,
     CMD_ERROR,
+    CMD_KEYPAD_CHAR,
     CMD_KEYPRESS,
+    CMD_LCD,
     CMD_PANEL_INFO,
     CMD_PANEL_STATE,
     CMD_PASSWORD,
@@ -25,6 +27,9 @@ from .const import (
     QUERY_MAX_AREAS,
     QUERY_MAX_REM_OUTPUTS,
     QUERY_MAX_ZONES,
+    QUERY_PANEL_TIME_H,
+    QUERY_PANEL_TIME_M,
+    QUERY_PANEL_TIME_S,
     QUERY_PART_ARM_TEXTS,
     QUERY_REM_OUTPUT_STATE,
     QUERY_REM_OUTPUT_TEXTS,
@@ -147,6 +152,11 @@ def build_output_toggle_packet(output_index: int, current_state: int) -> bytearr
     return load_data_pkt(CMD_CONTROL_OUTPUT, 1, 1, data)
 
 
+def build_keypad_char_packet(char: str) -> bytearray:
+    data = char.encode("ascii")
+    return load_data_pkt(CMD_KEYPAD_CHAR, 1, 1, data)
+
+
 def trim_packet(buf: bytearray) -> bytes:
     total_len = struct.unpack_from("<H", buf, 0)[0]
     return bytes(buf[:total_len])
@@ -187,6 +197,8 @@ class ParsedResponse:
     rem_output_names: list[str] = field(default_factory=list)
     part_arm_names: list[str] = field(default_factory=list)
     user_type: int = -1
+    lcd_raw: bytes = b""
+    panel_time: list[int] = field(default_factory=lambda: [0, 0, 0])
     commands: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -360,6 +372,18 @@ def parse_response(data: bytes, result: ParsedResponse | None = None) -> ParsedR
         elif cmd == QUERY_USER_TYPE and data_len > 0:
             result.user_type = payload[0] if payload else -1
 
+        elif cmd == CMD_LCD and data_len > 0:
+            result.lcd_raw = bytes(payload[:data_len])
+
+        elif cmd == QUERY_PANEL_TIME_H and data_len > 0:
+            result.panel_time[0] = payload[0]
+
+        elif cmd == QUERY_PANEL_TIME_M and data_len > 0:
+            result.panel_time[1] = payload[0]
+
+        elif cmd == QUERY_PANEL_TIME_S and data_len > 0:
+            result.panel_time[2] = payload[0]
+
         pos += data_len
 
     return result
@@ -492,5 +516,10 @@ class OrisecConnection:
         self, cmd: int, start: int, count: int, data: bytes
     ) -> ParsedResponse:
         pkt = load_data_pkt(cmd, start, count, data)
+        responses = await self.send_receive(pkt)
+        return parse_responses(responses)
+
+    async def send_keypad_char(self, char: str) -> ParsedResponse:
+        pkt = build_keypad_char_packet(char)
         responses = await self.send_receive(pkt)
         return parse_responses(responses)
