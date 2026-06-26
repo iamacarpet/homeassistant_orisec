@@ -211,6 +211,10 @@ function renderLcd(canvas, raw, time) {
       }
 
       ctx.textBaseline = "middle";
+
+      ctx.fillStyle = LCD_BG;
+      ctx.fillRect(xPx, y - LCD_LINE_H / 2, wUnits * PX_PER_UNIT, LCD_LINE_H);
+
       for (const c of chars) {
         const cw = FONT_MULT[c.fs || 0] * PX_PER_UNIT;
         const px = FONT_PX[c.fs || 0];
