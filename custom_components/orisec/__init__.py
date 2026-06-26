@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 
 from homeassistant.components import frontend
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
@@ -24,7 +25,9 @@ _WWW_DIR = Path(__file__).parent / "www"
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register the custom Lovelace card once per HA instance start.
     if not hass.data.get(f"{DOMAIN}_card_loaded"):
-        hass.http.register_static_path("/orisec_panel", str(_WWW_DIR), cache_headers=False)
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig("/orisec_panel", str(_WWW_DIR), cache_headers=False)]
+        )
         frontend.add_extra_js_url(hass, _CARD_URL)
         hass.data[f"{DOMAIN}_card_loaded"] = True
 
