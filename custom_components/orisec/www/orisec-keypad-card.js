@@ -32,8 +32,8 @@ const ICON_MAP = {
   165: "\u25B6", 166: "\u25C0", 170: "\u2731", 172: "\u25BC", 173: "\u25B2",
 };
 
-const FONT_MULT = [7.0, 4.5, 4.5, 4.9];
-const FONT_PX   = [20, 20, 20, 14];
+const FONT_MULT = [7.0, 4.5, 4.5, 3.8];
+const FONT_PX   = [20, 20, 20, 12];
 
 const LCD_W = 380;
 const LCD_H = 112;
@@ -45,8 +45,12 @@ const LCD_INV_FG = "#102040";
 const LCD_UNITS = 128;
 const PX_PER_UNIT = LCD_W / LCD_UNITS;
 
-function lcdFont(px, bold) {
-  return (bold ? "bold " : "") + px + "px 'Courier New','Lucida Console',monospace";
+const LCD_FONT = "'Courier New','Lucida Console',monospace";
+const LCD_ICON_FONT = "'OrisecV4','Courier New',monospace";
+
+function lcdFont(px, bold, isIcon) {
+  const family = isIcon ? LCD_ICON_FONT : LCD_FONT;
+  return (bold ? "bold " : "") + px + "px " + family;
 }
 
 function pad2(n) { return (n < 10 ? "0" : "") + n; }
@@ -81,10 +85,10 @@ function renderLcd(canvas, raw, time) {
     }
   }
 
-  function addCh(ch, inv, fs) {
+  function addCh(ch, inv, fs, icon) {
     ensureSeg();
     if (!seg) return;
-    seg.chars.push({ ch: ch, inv: inv, fs: fs });
+    seg.chars.push({ ch: ch, inv: inv, fs: fs, icon: icon || false });
     cursorX += FONT_MULT[fs];
   }
 
@@ -146,10 +150,9 @@ function renderLcd(canvas, raw, time) {
     } else if (b >= 22 && b <= 25) {
       fontSize = b - 22;
     } else if (b >= 32 && b <= 125 && cur >= 0) {
-      addCh(String.fromCharCode(b), inverted, fontSize);
+      addCh(String.fromCharCode(b), inverted, fontSize, false);
     } else if (b > 126 && b <= 173 && cur >= 0) {
-      const icon = ICON_MAP[b];
-      if (icon) addCh(icon, inverted, fontSize);
+      addCh(String.fromCharCode(b - 126 + 63), inverted, fontSize, true);
     }
     i++;
   }
@@ -193,8 +196,8 @@ function renderLcd(canvas, raw, time) {
 
       for (const c of chars) {
         const cw = FONT_MULT[c.fs || 0] * PX_PER_UNIT;
-        const px = FONT_PX[c.fs || 0];
-        ctx.font = lcdFont(px, c.inv);
+        const px = c.icon ? 18 : FONT_PX[c.fs || 0];
+        ctx.font = lcdFont(px, c.inv, c.icon);
 
         if (c.inv) {
           ctx.fillStyle = LCD_INV_BG;
@@ -213,6 +216,12 @@ function renderLcd(canvas, raw, time) {
 }
 
 const STYLES = `
+  @font-face {
+    font-family: 'OrisecV4';
+    src: url('/orisec_panel/orisecV4.ttf') format('truetype');
+    font-display: block;
+  }
+
   :host { display: block; }
   ha-card { overflow: hidden; }
 
