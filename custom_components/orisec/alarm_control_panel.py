@@ -98,7 +98,7 @@ class OrisecAlarmPanel(CoordinatorEntity[OrisecCoordinator], AlarmControlPanelEn
             "manufacturer": "Orisec",
             "model": self.coordinator.panel_type,
             "sw_version": self.coordinator.panel_version,
-            "configuration_url": "/orisec",
+            "configuration_url": "homeassistant://orisec",
         }
 
     @property
