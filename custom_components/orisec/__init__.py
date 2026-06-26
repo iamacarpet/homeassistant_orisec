@@ -52,6 +52,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         websocket_api.async_register_command(hass, ws_handle_keypad_subscribe)
         websocket_api.async_register_command(hass, ws_handle_keypad_press)
         websocket_api.async_register_command(hass, ws_handle_keypad_entries)
+        websocket_api.async_register_command(hass, ws_handle_panel_subscribe)
+        websocket_api.async_register_command(hass, ws_handle_panel_events)
         hass.data[f"{DOMAIN}_ws_registered"] = True
 
     coordinator = OrisecCoordinator(
@@ -167,3 +169,50 @@ async def ws_handle_keypad_press(
         connection.send_result(msg["id"])
     except (ConnectionError, ValueError) as err:
         connection.send_error(msg["id"], "error", str(err))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "orisec/panel/subscribe",
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_handle_panel_subscribe(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "Orisec entry not found")
+        return
+
+    def send_panel_update(state: dict) -> None:
+        connection.send_message(
+            websocket_api.event_message(msg["id"], state)
+        )
+
+    unsubscribe = coordinator.panel_subscribe(send_panel_update)
+    connection.subscriptions[msg["id"]] = unsubscribe
+    connection.send_result(msg["id"])
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "orisec/panel/events",
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_handle_panel_events(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "Orisec entry not found")
+        return
+
+    connection.send_result(msg["id"], coordinator.get_event_log())

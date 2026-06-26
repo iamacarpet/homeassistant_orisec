@@ -1,11 +1,3 @@
-/**
- * Orisec Panel — sidebar page
- *
- * Full-page custom element loaded by HA's panel_custom system.
- * Combines alarm status with the virtual keypad in a single view.
- * Receives `hass` and `panel` properties from HA's frontend framework.
- */
-
 const KEYPAD_BUTTONS = [
   { label: "1",      char: "1", cls: "num"    },
   { label: "2",      char: "2", cls: "num"    },
@@ -44,6 +36,153 @@ const STATE_INFO = {
   triggered:      { label: "ALARM!",         color: "#e53935", icon: "mdi:bell-ring"       },
 };
 
+const ICON_MAP = {
+  127: "\u25C0", 128: "E", 155: ":", 156: ".",
+  159: "\u2612", 160: "\u2610", 163: "\u25B2", 164: "\u25BC",
+  165: "\u25B6", 166: "\u25C0", 170: "\u2731", 172: "\u25BC", 173: "\u25B2",
+};
+
+const LCD_WIDTH = 320;
+const LCD_HEIGHT = 96;
+const LCD_LINE_H = 24;
+const LCD_FONT = "14px 'Courier New', 'Lucida Console', monospace";
+const LCD_BG = "#001832";
+const LCD_FG = "#e0e0e0";
+const LCD_INV_BG = "#e0e0e0";
+const LCD_INV_FG = "#001832";
+
+function renderLcd(canvas, raw, time) {
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = LCD_WIDTH * dpr;
+  canvas.height = LCD_HEIGHT * dpr;
+  canvas.style.width = LCD_WIDTH + "px";
+  canvas.style.height = LCD_HEIGHT + "px";
+  ctx.scale(dpr, dpr);
+
+  ctx.fillStyle = LCD_BG;
+  ctx.fillRect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+  ctx.font = LCD_FONT;
+  ctx.textBaseline = "middle";
+
+  if (!raw || raw.length === 0) return;
+
+  const lines = [[], [], [], []];
+  const lineAligns = ["left", "left", "left", "left"];
+  let cur = -1;
+  let inverted = false;
+
+  let i = 0;
+  while (i < raw.length) {
+    const b = raw[i];
+    if (b === 17) {
+      cur = cur === -1 ? 0 : Math.min(cur + 1, 3);
+      lines[cur] = [];
+      lineAligns[cur] = "left";
+      inverted = false;
+    } else if (b >= 18 && b <= 21) {
+      cur = b - 18;
+      lines[cur] = [];
+      lineAligns[cur] = "left";
+      inverted = false;
+    } else if (b === 5) {
+      inverted = false;
+    } else if (b === 6) {
+      inverted = true;
+    } else if (b === 10 && cur >= 0) {
+      lineAligns[cur] = "center";
+    } else if (b === 11 && cur >= 0) {
+      lineAligns[cur] = "right";
+    } else if (b === 12 && cur >= 0) {
+      const ts = (time[0] < 10 ? "0" : "") + time[0] + ":" +
+                 (time[1] < 10 ? "0" : "") + time[1] + "." +
+                 (time[2] < 10 ? "0" : "") + time[2];
+      for (let c = 0; c < ts.length; c++) {
+        lines[cur].push({ ch: ts[c], inv: inverted });
+      }
+    } else if (b === 14) {
+      if (cur >= 0 && i + 4 < raw.length) {
+        const pVal = raw[i + 1];
+        const pMax = raw[i + 2] || 1;
+        lines[cur].push({ progress: true, value: pVal, max: pMax, inv: inverted });
+      }
+      i += 4;
+    } else if (b === 7 || b === 8 || b === 16 || b === 26) {
+      i++;
+    } else if (b >= 22 && b <= 25) {
+      // font size markers — ignore
+    } else if (b >= 32 && b <= 125 && cur >= 0) {
+      lines[cur].push({ ch: String.fromCharCode(b), inv: inverted });
+    } else if (b > 126 && b <= 173 && cur >= 0) {
+      const icon = ICON_MAP[b];
+      if (icon) lines[cur].push({ ch: icon, inv: inverted });
+    }
+    i++;
+  }
+
+  for (let line = 0; line < 4; line++) {
+    const segments = lines[line];
+    if (!segments || segments.length === 0) continue;
+
+    const y = line * LCD_LINE_H + LCD_LINE_H / 2;
+    const hasProgress = segments.find(s => s.progress);
+
+    if (hasProgress) {
+      const s = hasProgress;
+      const barW = LCD_WIDTH - 16;
+      const barH = 8;
+      const barY = y - barH / 2;
+      ctx.strokeStyle = LCD_FG;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(8, barY, barW, barH);
+      const fill = Math.min(s.value / (s.max || 1), 1) * barW;
+      ctx.fillStyle = LCD_FG;
+      ctx.fillRect(8, barY, fill, barH);
+      continue;
+    }
+
+    const text = segments.map(s => s.ch).join("");
+    const textW = ctx.measureText(text).width;
+    let x = 8;
+    if (lineAligns[line] === "center") {
+      x = (LCD_WIDTH - textW) / 2;
+    } else if (lineAligns[line] === "right") {
+      x = LCD_WIDTH - textW - 8;
+    }
+
+    let currentInv = null;
+    let run = "";
+    let runX = x;
+
+    function flushRun(inv) {
+      if (!run) return;
+      const rw = ctx.measureText(run).width;
+      if (inv) {
+        ctx.fillStyle = LCD_INV_BG;
+        ctx.fillRect(runX, y - LCD_LINE_H / 2 + 2, rw, LCD_LINE_H - 4);
+        ctx.fillStyle = LCD_INV_FG;
+        ctx.font = "bold " + LCD_FONT;
+      } else {
+        ctx.fillStyle = LCD_FG;
+        ctx.font = LCD_FONT;
+      }
+      ctx.fillText(run, runX, y);
+      if (inv) ctx.font = LCD_FONT;
+      run = "";
+    }
+
+    for (const seg of segments) {
+      if (seg.inv !== currentInv) {
+        flushRun(currentInv);
+        currentInv = seg.inv;
+        runX = x + ctx.measureText(text.substring(0, segments.indexOf(seg))).width;
+      }
+      run += seg.ch;
+    }
+    flushRun(currentInv);
+  }
+}
+
 const PANEL_STYLES = `
   :host {
     display: block;
@@ -72,8 +211,7 @@ const PANEL_STYLES = `
     padding: 16px;
   }
 
-  /* Alarm status section */
-  .alarm-section {
+  .section {
     background: var(--card-background-color, #fff);
     border-radius: 12px;
     padding: 20px;
@@ -105,6 +243,21 @@ const PANEL_STYLES = `
   .alarm-state { font-size: 1.3rem; font-weight: 500; color: var(--primary-text-color); }
   .alarm-detail { font-size: 0.85rem; color: var(--secondary-text-color); margin-top: 2px; }
 
+  .system-indicators {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 16px;
+    font-size: 0.85rem;
+    color: var(--secondary-text-color);
+  }
+  .indicator { display: flex; align-items: center; gap: 4px; }
+  .indicator .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+  }
+  .dot.ok { background: #43a047; }
+  .dot.warn { background: #fb8c00; }
+  .dot.error { background: #e53935; }
+
   .arm-buttons {
     display: flex;
     flex-wrap: wrap;
@@ -127,30 +280,108 @@ const PANEL_STYLES = `
   .arm-btn.arm { background: var(--primary-color); color: var(--text-primary-color, #fff); }
   .arm-btn.disarm { background: var(--error-color, #e53935); color: #fff; }
 
-  /* Keypad section */
-  .keypad-section {
-    background: var(--card-background-color, #fff);
-    border-radius: 12px;
-    padding: 16px;
-    box-shadow: var(--ha-card-box-shadow, 0 2px 6px rgba(0,0,0,0.1));
+  .section-header {
+    font-size: 0.875rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--secondary-text-color);
+    margin-bottom: 12px;
   }
 
-  .lcd {
-    background: #001832;
-    color: #a0e8a0;
-    font-family: "Courier New", "Lucida Console", monospace;
-    font-size: 15px;
-    line-height: 1.55;
-    padding: 10px 14px;
+  .event-log {
+    max-height: 160px;
+    overflow-y: auto;
+  }
+  .event-item {
+    display: flex;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 0.85rem;
+    border-bottom: 1px solid var(--divider-color, #e8e8e8);
+  }
+  .event-item:last-child { border-bottom: none; }
+  .event-time {
+    color: var(--secondary-text-color);
+    font-family: monospace;
+    flex-shrink: 0;
+  }
+  .event-text { color: var(--primary-text-color); }
+  .event-text.alarm { color: var(--error-color, #e53935); font-weight: 600; }
+  .event-text.cleared { color: #43a047; }
+  .no-events { color: var(--secondary-text-color); font-size: 0.85rem; font-style: italic; }
+
+  .lcd-container {
+    position: relative;
     margin-bottom: 12px;
+  }
+  .lcd-canvas {
+    display: block;
+    width: 100%;
+    max-width: 320px;
+    margin: 0 auto;
     border-radius: 8px;
     border: 2px solid #003060;
-    min-height: 96px;
-    white-space: pre;
-    letter-spacing: 0.5px;
     box-shadow: inset 0 0 20px rgba(0,24,50,0.6);
+    background: #001832;
   }
-  .lcd .line { display: block; min-height: 1.55em; }
+  .lcd-overlay {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #001832;
+    border-radius: 8px;
+    border: 2px solid #003060;
+    cursor: pointer;
+    transition: filter 0.15s;
+    max-width: 320px;
+    margin: 0 auto;
+  }
+  .lcd-overlay:hover { filter: brightness(1.1); }
+  .lcd-overlay-text {
+    color: #a0e8a0;
+    font-family: "Courier New", monospace;
+    font-size: 14px;
+    text-align: center;
+  }
+  .lcd-loading {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #001832;
+    border-radius: 8px;
+    border: 2px solid #003060;
+    max-width: 320px;
+    margin: 0 auto;
+  }
+  .lcd-loading-text {
+    color: #a0e8a0;
+    font-family: "Courier New", monospace;
+    font-size: 14px;
+    animation: blink-text 1.2s ease-in-out infinite;
+  }
+  @keyframes blink-text { 0%,100% { opacity:1 } 50% { opacity:0.3 } }
+
+  .keypad-controls {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 12px;
+  }
+  .disconnect-btn {
+    padding: 6px 16px;
+    border: 1px solid var(--divider-color, #e0e0e0);
+    border-radius: 6px;
+    background: var(--card-background-color, #fff);
+    color: var(--secondary-text-color);
+    font-size: 0.8rem;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .disconnect-btn:hover { background: var(--secondary-background-color, #f5f5f5); }
 
   .keypad {
     display: grid;
@@ -180,6 +411,7 @@ const PANEL_STYLES = `
   .key.action { background: var(--primary-color); color: var(--text-primary-color, #fff); border-color: var(--primary-color); }
   .key.nav    { background: var(--secondary-background-color, #f5f5f5); font-size: 18px; }
   .key.blank  { visibility: hidden; pointer-events: none; }
+  .key.flash  { filter: brightness(1.3); }
 
   .panel-status {
     text-align: center;
@@ -196,22 +428,23 @@ class OrisecPanel extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this._hass = null;
     this._panel = null;
-    this._unsubscribe = null;
-    this._lcdLines = ["", "", "", ""];
+    this._panelUnsub = null;
+    this._keypadUnsub = null;
     this._entryId = null;
-    this._alarmEntity = null;
     this._rendered = false;
+    this._panelState = null;
+    this._keypadConnected = false;
+    this._keypadLoading = false;
+    this._lcdRaw = null;
+    this._lcdTime = [0, 0, 0];
   }
 
   set hass(hass) {
     const firstSet = !this._hass;
     this._hass = hass;
     if (firstSet) {
-      this._findAlarmEntity();
       this._render();
-      this._subscribe();
-    } else {
-      this._updateAlarmStatus();
+      this._subscribePanelState();
     }
   }
 
@@ -220,35 +453,33 @@ class OrisecPanel extends HTMLElement {
   }
 
   connectedCallback() {
-    if (this._hass && !this._unsubscribe) this._subscribe();
+    if (this._hass && !this._panelUnsub) this._subscribePanelState();
   }
 
   disconnectedCallback() {
-    if (this._unsubscribe) {
-      this._unsubscribe();
-      this._unsubscribe = null;
+    this._teardownPanel();
+    this._teardownKeypad();
+  }
+
+  _teardownPanel() {
+    if (this._panelUnsub) {
+      this._panelUnsub();
+      this._panelUnsub = null;
     }
   }
 
-  _findAlarmEntity() {
-    if (!this._hass) return;
-    const entities = Object.keys(this._hass.states).filter(
-      (e) => e.startsWith("alarm_control_panel.") &&
-        this._hass.states[e].attributes.home_mode !== undefined
-    );
-    if (entities.length > 0) {
-      this._alarmEntity = entities[0];
-    } else {
-      const all = Object.keys(this._hass.states).filter(
-        (e) => e.startsWith("alarm_control_panel.")
-      );
-      if (all.length > 0) this._alarmEntity = all[0];
+  _teardownKeypad() {
+    if (this._keypadUnsub) {
+      this._keypadUnsub();
+      this._keypadUnsub = null;
     }
+    this._keypadConnected = false;
+    this._keypadLoading = false;
+    this._lcdRaw = null;
   }
 
-  async _subscribe() {
-    if (!this._hass || this._unsubscribe) return;
-
+  async _subscribePanelState() {
+    if (!this._hass || this._panelUnsub) return;
     try {
       const entries = await this._hass.connection.sendMessagePromise({
         type: "orisec/keypad/entries",
@@ -260,22 +491,58 @@ class OrisecPanel extends HTMLElement {
         return;
       }
 
-      const msg = { type: "orisec/keypad/subscribe" };
+      const msg = { type: "orisec/panel/subscribe" };
       if (this._entryId) msg.entry_id = this._entryId;
 
-      this._unsubscribe = await this._hass.connection.subscribeMessage(
-        (event) => this._handleLcdUpdate(event),
+      this._panelUnsub = await this._hass.connection.subscribeMessage(
+        (event) => this._handlePanelUpdate(event),
         msg,
       );
-      this._setStatus("Connected");
     } catch (err) {
       this._setStatus("Connection failed: " + (err.message || err), true);
     }
   }
 
+  _handlePanelUpdate(state) {
+    this._panelState = state;
+    this._updateAlarmSection();
+    this._updateEventLog();
+  }
+
+  async _connectKeypad() {
+    if (!this._hass || this._keypadUnsub) return;
+    this._keypadLoading = true;
+    this._updateKeypadView();
+
+    try {
+      const msg = { type: "orisec/keypad/subscribe" };
+      if (this._entryId) msg.entry_id = this._entryId;
+
+      this._keypadUnsub = await this._hass.connection.subscribeMessage(
+        (event) => this._handleLcdUpdate(event),
+        msg,
+      );
+      this._keypadConnected = true;
+      this._updateKeypadView();
+    } catch (err) {
+      this._keypadLoading = false;
+      this._keypadConnected = false;
+      this._updateKeypadView();
+      this._setStatus("Keypad connection failed: " + (err.message || err), true);
+    }
+  }
+
+  _disconnectKeypad() {
+    this._teardownKeypad();
+    this._updateKeypadView();
+  }
+
   _handleLcdUpdate(event) {
-    this._lcdLines = event.lines || ["", "", "", ""];
-    this._updateLcd();
+    this._lcdRaw = event.lcd_raw || [];
+    this._lcdTime = event.time || [0, 0, 0];
+    this._keypadLoading = false;
+    this._updateKeypadView();
+    this._renderLcd();
   }
 
   async _sendKey(char) {
@@ -290,10 +557,20 @@ class OrisecPanel extends HTMLElement {
   }
 
   _callAlarmService(service) {
-    if (!this._hass || !this._alarmEntity) return;
-    this._hass.callService("alarm_control_panel", service, {
-      entity_id: this._alarmEntity,
-    });
+    if (!this._hass || !this._panelState) return;
+    const entities = Object.keys(this._hass.states).filter(
+      e => e.startsWith("alarm_control_panel.") &&
+        this._hass.states[e].attributes.home_mode !== undefined
+    );
+    let entity = entities[0];
+    if (!entity) {
+      const all = Object.keys(this._hass.states).filter(
+        e => e.startsWith("alarm_control_panel.")
+      );
+      entity = all[0];
+    }
+    if (!entity) return;
+    this._hass.callService("alarm_control_panel", service, { entity_id: entity });
   }
 
   _render() {
@@ -308,33 +585,61 @@ class OrisecPanel extends HTMLElement {
         <span>Orisec</span>
       </div>
       <div class="content">
-        <div class="alarm-section">
+        <div class="section" id="alarm-section">
           <div class="alarm-status">
             <div class="alarm-badge" id="alarm-badge">
               <ha-icon id="alarm-icon" icon="mdi:shield-off"></ha-icon>
             </div>
             <div class="alarm-info">
-              <div class="alarm-state" id="alarm-state">Loading...</div>
+              <div class="alarm-state" id="alarm-state">Connecting...</div>
               <div class="alarm-detail" id="alarm-detail"></div>
             </div>
           </div>
+          <div class="system-indicators" id="system-indicators"></div>
           <div class="arm-buttons" id="arm-buttons"></div>
         </div>
-        <div class="keypad-section">
-          <div class="lcd">${
-            [0,1,2,3].map(i => `<span class="line line-${i}"></span>`).join("")
-          }</div>
-          <div class="keypad">${buttonsHtml}</div>
+
+        <div class="section" id="events-section">
+          <div class="section-header">Recent Events</div>
+          <div class="event-log" id="event-log">
+            <div class="no-events">No events recorded</div>
+          </div>
+        </div>
+
+        <div class="section" id="keypad-section">
+          <div class="section-header">Keypad</div>
+          <div class="lcd-container" id="lcd-container">
+            <canvas class="lcd-canvas" id="lcd-canvas" width="320" height="96"></canvas>
+            <div class="lcd-overlay" id="lcd-overlay">
+              <div class="lcd-overlay-text">Click to connect keypad</div>
+            </div>
+          </div>
+          <div class="keypad-controls" id="keypad-controls" style="display:none">
+            <button class="disconnect-btn" id="disconnect-btn">Disconnect</button>
+          </div>
+          <div class="keypad" id="keypad-grid" style="display:none">${buttonsHtml}</div>
           <div class="panel-status" id="panel-status"></div>
         </div>
       </div>`;
 
-    this.shadowRoot.querySelector(".keypad").addEventListener("click", (e) => {
+    this.shadowRoot.getElementById("lcd-overlay").addEventListener("click", () => {
+      this._connectKeypad();
+    });
+
+    this.shadowRoot.getElementById("disconnect-btn").addEventListener("click", () => {
+      this._disconnectKeypad();
+    });
+
+    this.shadowRoot.getElementById("keypad-grid").addEventListener("click", (e) => {
       const btn = e.target.closest(".key");
       if (!btn) return;
       const idx = parseInt(btn.dataset.idx, 10);
       const def = KEYPAD_BUTTONS[idx];
-      if (def && def.char) this._sendKey(def.char);
+      if (def && def.char) {
+        this._sendKey(def.char);
+        btn.classList.add("flash");
+        setTimeout(() => btn.classList.remove("flash"), 120);
+      }
     });
 
     this.shadowRoot.getElementById("arm-buttons").addEventListener("click", (e) => {
@@ -344,62 +649,138 @@ class OrisecPanel extends HTMLElement {
     });
 
     this._rendered = true;
-    this._updateAlarmStatus();
   }
 
-  _updateAlarmStatus() {
-    if (!this._rendered || !this._hass || !this._alarmEntity) return;
-    const stateObj = this._hass.states[this._alarmEntity];
-    if (!stateObj) return;
+  _updateAlarmSection() {
+    if (!this._rendered || !this._panelState) return;
+    const ps = this._panelState;
+    const area = ps.areas && ps.areas[0];
+    if (!area) return;
 
-    const state = stateObj.state;
+    const state = area.state;
     const info = STATE_INFO[state] || { label: state, color: "#9e9e9e", icon: "mdi:shield" };
-    const attrs = stateObj.attributes;
 
     const badge = this.shadowRoot.getElementById("alarm-badge");
     badge.style.background = info.color;
-    badge.className = "alarm-badge" + (["arming","pending","triggered"].includes(state) ? " blink" : "");
+    badge.className = "alarm-badge" + (
+      ["arming", "pending", "triggered"].includes(state) ? " blink" : ""
+    );
 
-    const icon = this.shadowRoot.getElementById("alarm-icon");
-    icon.setAttribute("icon", info.icon);
+    this.shadowRoot.getElementById("alarm-icon").setAttribute("icon", info.icon);
 
     let label = info.label;
-    if (state === "armed_home" && attrs.home_mode) label = `Set \u2013 ${attrs.home_mode}`;
-    if (state === "armed_night" && attrs.night_mode) label = `Set \u2013 ${attrs.night_mode}`;
-    if (state === "armed_vacation" && attrs.vacation_mode) label = `Set \u2013 ${attrs.vacation_mode}`;
+    const names = ps.part_arm_names || [];
+    if (state === "armed_home" && names[0]) label = "Set \u2013 " + names[0];
+    if (state === "armed_night" && names[1]) label = "Set \u2013 " + names[1];
+    if (state === "armed_vacation" && names[2]) label = "Set \u2013 " + names[2];
     this.shadowRoot.getElementById("alarm-state").textContent = label;
 
     const details = [];
-    if (attrs.ready !== undefined) details.push(attrs.ready ? "Ready" : "Not Ready");
-    if (attrs.trouble) details.push("Trouble");
-    if (attrs.bypass) details.push("Bypass");
+    if (area.ready !== undefined) details.push(area.ready ? "Ready" : "Not Ready");
+    if (area.trouble) details.push("Trouble");
+    if (area.bypass) details.push("Bypass");
     this.shadowRoot.getElementById("alarm-detail").textContent = details.join(" \u2022 ");
 
-    const isArmed = ["armed_away","armed_home","armed_night","armed_vacation","triggered","pending"].includes(state);
+    let indicators = "";
+    const acOk = ps.ac_power;
+    const batFault = ps.battery_fault;
+    indicators += `<div class="indicator"><span class="dot ${acOk ? "ok" : "error"}"></span>AC${acOk ? "" : " Fault"}</div>`;
+    indicators += `<div class="indicator"><span class="dot ${batFault ? "error" : "ok"}"></span>Battery${batFault ? " Fault" : ""}</div>`;
+    if (area.trouble) {
+      indicators += `<div class="indicator"><span class="dot warn"></span>Trouble</div>`;
+    }
+    this.shadowRoot.getElementById("system-indicators").innerHTML = indicators;
+
+    const isArmed = ["armed_away", "armed_home", "armed_night", "armed_vacation", "triggered", "pending"].includes(state);
     const isTransitioning = state === "arming" || state === "pending";
-    const features = attrs.supported_features || 0;
+    const mask = ps.part_arm_mask || 0;
 
     let btns = "";
     if (isArmed && !isTransitioning) {
       btns = `<button class="arm-btn disarm" data-svc="alarm_disarm">Disarm</button>`;
     }
     if (!isArmed) {
-      if (features & 2) btns += `<button class="arm-btn arm" data-svc="alarm_arm_away">Full Set</button>`;
-      if (features & 1) btns += `<button class="arm-btn arm" data-svc="alarm_arm_home">${attrs.home_mode || "Part 1"}</button>`;
-      if (features & 4) btns += `<button class="arm-btn arm" data-svc="alarm_arm_night">${attrs.night_mode || "Part 2"}</button>`;
-      if (features & 8) btns += `<button class="arm-btn arm" data-svc="alarm_arm_vacation">${attrs.vacation_mode || "Part 3"}</button>`;
+      btns += `<button class="arm-btn arm" data-svc="alarm_arm_away">Full Set</button>`;
+      if (mask & 1) btns += `<button class="arm-btn arm" data-svc="alarm_arm_home">${names[0] || "Part 1"}</button>`;
+      if (mask & 2) btns += `<button class="arm-btn arm" data-svc="alarm_arm_night">${names[1] || "Part 2"}</button>`;
+      if (mask & 4) btns += `<button class="arm-btn arm" data-svc="alarm_arm_vacation">${names[2] || "Part 3"}</button>`;
     }
     this.shadowRoot.getElementById("arm-buttons").innerHTML = btns;
   }
 
-  _updateLcd() {
-    if (!this._rendered) return;
-    const lcd = this.shadowRoot.querySelector(".lcd");
-    if (!lcd) return;
-    for (let i = 0; i < 4; i++) {
-      const el = lcd.querySelector(`.line-${i}`);
-      if (el) el.textContent = this._lcdLines[i] || "";
+  _updateEventLog() {
+    if (!this._rendered || !this._panelState) return;
+    const events = this._panelState.events || [];
+    const container = this.shadowRoot.getElementById("event-log");
+
+    if (events.length === 0) {
+      container.innerHTML = '<div class="no-events">No events recorded</div>';
+      return;
     }
+
+    container.innerHTML = events.slice().reverse().map(ev => {
+      const time = ev.timestamp ? ev.timestamp.split("T")[1] || "" : "";
+      const shortTime = time.substring(0, 5);
+      let text = "";
+      let cls = "";
+      if (ev.type === "alarm_triggered") {
+        text = ev.area_name + " \u2014 ALARM TRIGGERED";
+        if (ev.data.fire) text += " (Fire)";
+        if (ev.data.pa) text += " (PA)";
+        cls = "alarm";
+      } else if (ev.type === "alarm_cleared") {
+        text = ev.area_name + " \u2014 Alarm Cleared";
+        cls = "cleared";
+      } else if (ev.type === "state_changed") {
+        const oldLabel = (STATE_INFO[ev.data.old_state] || {}).label || ev.data.old_state;
+        const newLabel = (STATE_INFO[ev.data.new_state] || {}).label || ev.data.new_state;
+        text = ev.area_name + " \u2014 " + oldLabel + " \u2192 " + newLabel;
+      }
+      return `<div class="event-item"><span class="event-time">${shortTime}</span><span class="event-text ${cls}">${text}</span></div>`;
+    }).join("");
+  }
+
+  _updateKeypadView() {
+    if (!this._rendered) return;
+    const overlay = this.shadowRoot.getElementById("lcd-overlay");
+    const canvas = this.shadowRoot.getElementById("lcd-canvas");
+    const controls = this.shadowRoot.getElementById("keypad-controls");
+    const grid = this.shadowRoot.getElementById("keypad-grid");
+    const container = this.shadowRoot.getElementById("lcd-container");
+
+    const existingLoading = container.querySelector(".lcd-loading");
+
+    if (!this._keypadConnected && !this._keypadLoading) {
+      overlay.style.display = "flex";
+      if (existingLoading) existingLoading.remove();
+      canvas.style.display = "none";
+      controls.style.display = "none";
+      grid.style.display = "none";
+    } else if (this._keypadLoading && !this._lcdRaw) {
+      overlay.style.display = "none";
+      canvas.style.display = "none";
+      controls.style.display = "none";
+      grid.style.display = "none";
+      if (!existingLoading) {
+        const loading = document.createElement("div");
+        loading.className = "lcd-loading";
+        loading.innerHTML = '<div class="lcd-loading-text">Loading, please wait...</div>';
+        container.appendChild(loading);
+      }
+    } else {
+      overlay.style.display = "none";
+      if (existingLoading) existingLoading.remove();
+      canvas.style.display = "block";
+      controls.style.display = "flex";
+      grid.style.display = "grid";
+    }
+  }
+
+  _renderLcd() {
+    if (!this._rendered || !this._lcdRaw) return;
+    const canvas = this.shadowRoot.getElementById("lcd-canvas");
+    if (!canvas) return;
+    renderLcd(canvas, this._lcdRaw, this._lcdTime);
   }
 
   _setStatus(text, isError) {

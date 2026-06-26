@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
@@ -39,16 +39,21 @@ from .const import (
     CMD_PANEL_STATE,
     SOS_ALARM,
     SOS_ARMED,
+    SOS_BATTERY_FAULT,
     SOS_BELL,
+    SOS_BYPASS,
     SOS_FIRE,
     SOS_IN_ALARM,
     SOS_IN_ENTRY,
     SOS_IN_EXIT,
     SOS_PA,
+    SOS_PANEL_AC_ON,
     SOS_PART_ARMED,
     SOS_PART1,
     SOS_PART2,
     SOS_PART3,
+    SOS_READY,
+    SOS_TROUBLE,
     KEY_FULL_ARM,
     KEY_PART1,
     KEY_PART2,
@@ -118,10 +123,14 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._prev_alarm_state: dict[int, bool] = {}
         self._prev_arm_state: dict[int, str] = {}
 
+        self._event_log: list[dict] = []
+
         self._keypad_subscribers: int = 0
-        self._lcd_lines: list[str] = ["", "", "", ""]
+        self._lcd_raw: bytes = b""
         self._panel_time: list[int] = [0, 0, 0]
         self._lcd_callbacks: list[Callable] = []
+
+        self._panel_callbacks: list[Callable] = []
 
     @property
     def host(self) -> str:
@@ -276,14 +285,12 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             if self._keypad_subscribers > 0 and result.lcd_raw:
                 self._panel_time = result.panel_time[:]
-                new_lines = self._parse_lcd_text(
-                    result.lcd_raw, self._panel_time
-                )
-                if new_lines != self._lcd_lines:
-                    self._lcd_lines = new_lines
+                if result.lcd_raw != self._lcd_raw:
+                    self._lcd_raw = result.lcd_raw
                     self._notify_lcd_subscribers()
 
             self._check_alarm_events()
+            self._notify_panel_subscribers()
 
             return {
                 "sys_output_state": self.sys_output_state,
@@ -306,6 +313,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def _check_alarm_events(self) -> None:
         sos = self.sys_output_state
+        now = datetime.now().isoformat(timespec="seconds")
         for area_idx in range(self.max_areas):
             bit = 1 << area_idx
             area_name = (
@@ -317,39 +325,48 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             in_alarm = bool(sos[SOS_ALARM] & bit) or bool(sos[SOS_IN_ALARM] & bit)
             prev_alarm = self._prev_alarm_state.get(area_idx, False)
             if in_alarm and not prev_alarm:
-                self.hass.bus.async_fire(
-                    f"{DOMAIN}_alarm_triggered",
-                    {
-                        "area": area_idx + 1,
-                        "area_name": area_name,
-                        "fire": bool(sos[SOS_FIRE] & bit),
-                        "pa": bool(sos[SOS_PA] & bit),
-                        "bell": bool(sos[SOS_BELL] & bit),
-                    },
-                )
+                event_data = {
+                    "area": area_idx + 1,
+                    "area_name": area_name,
+                    "fire": bool(sos[SOS_FIRE] & bit),
+                    "pa": bool(sos[SOS_PA] & bit),
+                    "bell": bool(sos[SOS_BELL] & bit),
+                }
+                self.hass.bus.async_fire(f"{DOMAIN}_alarm_triggered", event_data)
+                self._append_event("alarm_triggered", area_name, event_data, now)
             elif prev_alarm and not in_alarm:
-                self.hass.bus.async_fire(
-                    f"{DOMAIN}_alarm_cleared",
-                    {
-                        "area": area_idx + 1,
-                        "area_name": area_name,
-                    },
-                )
+                event_data = {
+                    "area": area_idx + 1,
+                    "area_name": area_name,
+                }
+                self.hass.bus.async_fire(f"{DOMAIN}_alarm_cleared", event_data)
+                self._append_event("alarm_cleared", area_name, event_data, now)
             self._prev_alarm_state[area_idx] = in_alarm
 
             current_state = self.get_alarm_state_for_area(area_idx)
             prev_state = self._prev_arm_state.get(area_idx)
             if prev_state is not None and current_state != prev_state:
-                self.hass.bus.async_fire(
-                    f"{DOMAIN}_state_changed",
-                    {
-                        "area": area_idx + 1,
-                        "area_name": area_name,
-                        "old_state": prev_state,
-                        "new_state": current_state,
-                    },
-                )
+                event_data = {
+                    "area": area_idx + 1,
+                    "area_name": area_name,
+                    "old_state": prev_state,
+                    "new_state": current_state,
+                }
+                self.hass.bus.async_fire(f"{DOMAIN}_state_changed", event_data)
+                self._append_event("state_changed", area_name, event_data, now)
             self._prev_arm_state[area_idx] = current_state
+
+    def _append_event(
+        self, event_type: str, area_name: str, data: dict, timestamp: str
+    ) -> None:
+        self._event_log.append({
+            "type": event_type,
+            "area_name": area_name,
+            "data": data,
+            "timestamp": timestamp,
+        })
+        if len(self._event_log) > 20:
+            self._event_log = self._event_log[-20:]
 
     async def async_send_keypress(self, key_code: int, area_mask: int) -> None:
         if not self._conn.connected:
@@ -461,7 +478,6 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return 1
 
     def is_area_ready(self, area_idx: int) -> bool:
-        from .const import SOS_READY
         return bool(self.sys_output_state[SOS_READY] & (1 << area_idx))
 
     # ── Keypad / LCD ────────────────────────────────────────────────────────
@@ -482,12 +498,8 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _get_lcd_state(self) -> dict:
         return {
-            "lines": self._lcd_lines[:],
-            "time": (
-                f"{self._panel_time[0]:02d}:"
-                f"{self._panel_time[1]:02d}:"
-                f"{self._panel_time[2]:02d}"
-            ),
+            "lcd_raw": list(self._lcd_raw),
+            "time": self._panel_time[:],
         }
 
     @callback
@@ -508,37 +520,61 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._keypad_subscribers > 0:
             await self.async_request_refresh()
 
-    @staticmethod
-    def _parse_lcd_text(raw: bytes, panel_time: list[int]) -> list[str]:
-        lines: list[str] = ["", "", "", ""]
-        cur = -1
-        i = 0
-        while i < len(raw):
-            b = raw[i]
-            if b == 17:
-                cur = 0 if cur == -1 else min(cur + 1, 3)
-                lines[cur] = ""
-            elif 18 <= b <= 21:
-                cur = b - 18
-                lines[cur] = ""
-            elif b == 12:
-                if cur >= 0:
-                    lines[cur] += (
-                        f"{panel_time[0]:02d}:{panel_time[1]:02d}"
-                        f".{panel_time[2]:02d}"
-                    )
-            elif b == 14:
-                i = min(i + 4, len(raw) - 1)
-            elif b in (7, 8, 16, 26):
-                i = min(i + 1, len(raw) - 1)
-            elif 32 <= b <= 126 and cur >= 0:
-                lines[cur] += chr(b)
-            elif 126 < b <= 173 and cur >= 0:
-                _ICON_MAP = {
-                    127: "<", 128: "E", 155: ":", 156: ".",
-                    159: "[x]", 160: "[ ]", 163: "^", 164: "v",
-                    165: ">", 166: "<", 170: "*", 172: "v", 173: "^",
-                }
-                lines[cur] += _ICON_MAP.get(b, "")
-            i += 1
-        return [line.rstrip() for line in lines]
+    # ── Panel state subscription ────────────────────────────────────────────
+
+    def panel_subscribe(self, send_callback: Callable) -> Callable:
+        self._panel_callbacks.append(send_callback)
+        send_callback(self.get_panel_state())
+
+        def unsubscribe() -> None:
+            if send_callback in self._panel_callbacks:
+                self._panel_callbacks.remove(send_callback)
+
+        return unsubscribe
+
+    def get_panel_state(self) -> dict:
+        sos = self.sys_output_state
+        areas = []
+        for area_idx in range(self.max_areas):
+            bit = 1 << area_idx
+            area_name = (
+                self.area_names[area_idx]
+                if area_idx < len(self.area_names) and self.area_names[area_idx]
+                else f"Area {area_idx + 1}"
+            )
+            areas.append({
+                "name": area_name,
+                "state": self.get_alarm_state_for_area(area_idx),
+                "ready": bool(sos[SOS_READY] & bit),
+                "trouble": bool(sos[SOS_TROUBLE] & bit),
+                "bypass": bool(sos[SOS_BYPASS] & bit),
+                "bell": bool(sos[SOS_BELL] & bit),
+                "in_alarm": bool(sos[SOS_ALARM] & bit) or bool(sos[SOS_IN_ALARM] & bit),
+                "in_entry": bool(sos[SOS_IN_ENTRY] & bit),
+                "in_exit": bool(sos[SOS_IN_EXIT] & bit),
+            })
+        return {
+            "areas": areas,
+            "part_arm_names": self.part_arm_names[:],
+            "part_arm_mask": self.part_arm_mask,
+            "ac_power": bool(sos[SOS_PANEL_AC_ON] & 0xFF) if len(sos) > SOS_PANEL_AC_ON else True,
+            "battery_fault": bool(sos[SOS_BATTERY_FAULT] & 0xFF) if len(sos) > SOS_BATTERY_FAULT else False,
+            "panel_type": self.panel_type,
+            "panel_version": self.panel_version,
+            "connected": self.connected,
+            "events": self._event_log[:],
+        }
+
+    def get_event_log(self) -> list[dict]:
+        return self._event_log[:]
+
+    @callback
+    def _notify_panel_subscribers(self) -> None:
+        if not self._panel_callbacks:
+            return
+        state = self.get_panel_state()
+        for cb in self._panel_callbacks[:]:
+            try:
+                cb(state)
+            except Exception:
+                _LOGGER.debug("Error notifying panel subscriber", exc_info=True)
