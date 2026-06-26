@@ -164,6 +164,11 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.part_arm_mask = result.part_arm_mask
         self.user_area = result.user_area
         self.user_number = result.user_number
+        _LOGGER.info(
+            "Login OK: panel=%s max_zones=%d max_areas=%d user_area=0x%X user=%d",
+            self.panel_type, self.max_zones, self.max_areas,
+            self.user_area, self.user_number,
+        )
 
     async def _do_config(self) -> None:
         if self.max_zones == 0:
@@ -185,6 +190,12 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.max_zones = 20
         if self.max_areas == 0:
             self.max_areas = 2
+        if self.user_area == 0:
+            self.user_area = (1 << self.max_areas) - 1
+            _LOGGER.warning(
+                "user_area was 0 after login, defaulting to all areas: 0x%X",
+                self.user_area,
+            )
 
     async def _do_initial_data(self) -> None:
         await asyncio.sleep(0.3)

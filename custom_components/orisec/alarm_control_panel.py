@@ -40,11 +40,18 @@ async def async_setup_entry(
     coordinator: OrisecCoordinator = hass.data[DOMAIN][entry.entry_id]
     entities: list[AlarmControlPanelEntity] = []
 
+    _LOGGER.debug(
+        "Setting up alarm panels: max_areas=%s, user_area=0x%X",
+        coordinator.max_areas, coordinator.user_area,
+    )
+
     for area_idx in range(coordinator.max_areas):
         if not (coordinator.user_area & (1 << area_idx)):
+            _LOGGER.debug("Skipping area %d (not in user_area mask)", area_idx)
             continue
         entities.append(OrisecAlarmPanel(coordinator, entry, area_idx))
 
+    _LOGGER.debug("Adding %d alarm panel entities", len(entities))
     async_add_entities(entities)
 
 
