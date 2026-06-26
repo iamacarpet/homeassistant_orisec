@@ -1,12 +1,17 @@
 {
   "domain": "orisec",
   "name": "Orisec ControlPlus2",
-  "codeowners": ["@iamacarpet"],
+  "codeowners": [
+    "@iamacarpet"
+  ],
   "config_flow": true,
+  "dependencies": [
+    "http",
+    "frontend"
+  ],
   "documentation": "https://github.com/iamacarpet/homeassistant_orisec",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/iamacarpet/homeassistant_orisec/issues",
-  "dependencies": ["http", "frontend"],
   "requirements": [],
   "version": "1.0.0"
 }
