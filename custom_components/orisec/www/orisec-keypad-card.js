@@ -31,171 +31,178 @@ const ICON_MAP = {
   165: "\u25B6", 166: "\u25C0", 170: "\u2731", 172: "\u25BC", 173: "\u25B2",
 };
 
-// Display is 128 units wide. Character widths per font size index:
-const FONT_MULTIPLIER = [7.0, 4.5, 4.5, 4.9];
-// Map font size index to pixel font size for canvas rendering:
-const FONT_SIZES = [20, 20, 20, 14];
+const FONT_MULT = [7.0, 4.5, 4.5, 4.9];
+const FONT_PX   = [20, 20, 20, 14];
 
-const LCD_WIDTH = 380;
-const LCD_HEIGHT = 112;
+const LCD_W = 380;
+const LCD_H = 112;
 const LCD_LINE_H = 28;
 const LCD_BG = "#001832";
 const LCD_FG = "#e0e0e0";
 const LCD_INV_BG = "#e0e0e0";
 const LCD_INV_FG = "#102040";
 const LCD_UNITS = 128;
+const PX_PER_UNIT = LCD_W / LCD_UNITS;
 
-function lcdFont(size, bold) {
-  return (bold ? "bold " : "") + size + "px 'Courier New', 'Lucida Console', monospace";
+function lcdFont(px, bold) {
+  return (bold ? "bold " : "") + px + "px 'Courier New','Lucida Console',monospace";
 }
+
+function pad2(n) { return (n < 10 ? "0" : "") + n; }
 
 function renderLcd(canvas, raw, time) {
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
-  canvas.width = LCD_WIDTH * dpr;
-  canvas.height = LCD_HEIGHT * dpr;
-  canvas.style.width = LCD_WIDTH + "px";
-  canvas.style.height = LCD_HEIGHT + "px";
+  canvas.width = LCD_W * dpr;
+  canvas.height = LCD_H * dpr;
+  canvas.style.width = LCD_W + "px";
+  canvas.style.height = LCD_H + "px";
   ctx.scale(dpr, dpr);
-
   ctx.fillStyle = LCD_BG;
-  ctx.fillRect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+  ctx.fillRect(0, 0, LCD_W, LCD_H);
 
   if (!raw || raw.length === 0) return;
 
   const lines = [[], [], [], []];
-  const lineAligns = ["left", "left", "left", "left"];
-  const linePadX = [null, null, null, null];
-  let cur = -1;
-  let inverted = false;
-  let fontSize = 0;
+  let cur = -1, inverted = false, fontSize = 0, cursorX = 0;
+  let seg = null;
+
+  function flush() {
+    if (seg && seg.chars && seg.chars.length > 0 && cur >= 0) {
+      lines[cur].push(seg);
+    }
+    seg = null;
+  }
+
+  function ensureSeg() {
+    if (!seg && cur >= 0) {
+      seg = { x: cursorX, chars: [], align: "left" };
+    }
+  }
+
+  function addCh(ch, inv, fs) {
+    ensureSeg();
+    if (!seg) return;
+    seg.chars.push({ ch: ch, inv: inv, fs: fs });
+    cursorX += FONT_MULT[fs];
+  }
+
+  function selectLine(ln) {
+    flush();
+    cur = ln;
+    lines[cur] = [];
+    cursorX = 0;
+    inverted = false;
+    fontSize = 0;
+    seg = { x: 0, chars: [], align: "left" };
+  }
 
   let i = 0;
   while (i < raw.length) {
     const b = raw[i];
+
     if (b === 17) {
-      cur = cur === -1 ? 0 : Math.min(cur + 1, 3);
-      lines[cur] = [];
-      lineAligns[cur] = "left";
-      linePadX[cur] = null;
-      inverted = false;
-      fontSize = 0;
+      selectLine(cur === -1 ? 0 : Math.min(cur + 1, 3));
     } else if (b >= 18 && b <= 21) {
-      cur = b - 18;
-      lines[cur] = [];
-      lineAligns[cur] = "left";
-      linePadX[cur] = null;
-      inverted = false;
-      fontSize = 0;
+      selectLine(b - 18);
     } else if (b === 5) {
       inverted = false;
     } else if (b === 6) {
       inverted = true;
     } else if (b === 8 && i + 1 < raw.length) {
       i++;
-      if (cur >= 0) linePadX[cur] = raw[i];
-    } else if (b === 9) {
-      if (cur >= 0) linePadX[cur] = 0;
-    } else if (b === 10 && cur >= 0) {
-      lineAligns[cur] = "center";
-    } else if (b === 11 && cur >= 0) {
-      lineAligns[cur] = "right";
-    } else if (b === 12 && cur >= 0) {
-      const ts = (time[0] < 10 ? "0" : "") + time[0] + ":" +
-                 (time[1] < 10 ? "0" : "") + time[1] + "." +
-                 (time[2] < 10 ? "0" : "") + time[2];
-      for (let c = 0; c < ts.length; c++) {
-        lines[cur].push({ ch: ts[c], inv: inverted, fs: fontSize });
+      if (cur >= 0) {
+        flush();
+        cursorX = raw[i];
+        seg = { x: cursorX, chars: [], align: "left" };
       }
+    } else if (b === 9) {
+      if (cur >= 0) {
+        flush();
+        cursorX = 0;
+        seg = { x: 0, chars: [], align: "left" };
+      }
+    } else if (b === 10 && cur >= 0) {
+      flush();
+      seg = { x: cursorX, chars: [], align: "center" };
+    } else if (b === 11 && cur >= 0) {
+      flush();
+      seg = { x: cursorX, chars: [], align: "right" };
+    } else if (b === 12 && cur >= 0) {
+      const ts = pad2(time[0]) + ":" + pad2(time[1]) + "." + pad2(time[2]);
+      for (let c = 0; c < ts.length; c++) addCh(ts[c], inverted, fontSize);
     } else if (b === 14) {
       if (cur >= 0 && i + 3 < raw.length) {
+        flush();
         lines[cur].push({
-          progress: true,
-          value: raw[i + 3],
-          max: raw[i + 2] || 1,
-          barWidth: raw[i + 1],
+          progress: true, barWidth: raw[i + 1],
+          max: raw[i + 2] || 1, value: raw[i + 3],
         });
       }
       i += 3;
-    } else if (b === 7 || b === 16) {
-      i++;
-    } else if (b === 26) {
+    } else if (b === 7 || b === 16 || b === 26) {
       i++;
     } else if (b >= 22 && b <= 25) {
       fontSize = b - 22;
     } else if (b >= 32 && b <= 125 && cur >= 0) {
-      lines[cur].push({ ch: String.fromCharCode(b), inv: inverted, fs: fontSize });
+      addCh(String.fromCharCode(b), inverted, fontSize);
     } else if (b > 126 && b <= 173 && cur >= 0) {
       const icon = ICON_MAP[b];
-      if (icon) lines[cur].push({ ch: icon, inv: inverted, fs: fontSize, isIcon: true });
+      if (icon) addCh(icon, inverted, fontSize);
     }
     i++;
   }
+  flush();
 
-  const pxPerUnit = LCD_WIDTH / LCD_UNITS;
+  for (let ln = 0; ln < 4; ln++) {
+    const segs = lines[ln];
+    if (!segs || segs.length === 0) continue;
+    const y = ln * LCD_LINE_H + LCD_LINE_H / 2;
 
-  for (let line = 0; line < 4; line++) {
-    const segments = lines[line];
-    if (!segments || segments.length === 0) continue;
-
-    const y = line * LCD_LINE_H + LCD_LINE_H / 2;
-    const hasProgress = segments.find(s => s.progress);
-
-    if (hasProgress) {
-      const s = hasProgress;
-      const barW = (s.barWidth || 100) * pxPerUnit;
-      const barH = 10;
-      const barX = (LCD_WIDTH - barW) / 2;
-      const barY = y - barH / 2;
-      ctx.strokeStyle = LCD_FG;
-      ctx.lineWidth = 1;
-      ctx.strokeRect(barX, barY, barW, barH);
-      const fill = Math.min(s.value / (s.max || 1), 1) * barW;
-      ctx.fillStyle = LCD_FG;
-      ctx.fillRect(barX, barY, fill, barH);
-      continue;
-    }
-
-    let totalUnits = 0;
-    for (const seg of segments) {
-      totalUnits += FONT_MULTIPLIER[seg.fs || 0];
-    }
-
-    let startX;
-    if (linePadX[line] !== null) {
-      startX = linePadX[line] * pxPerUnit;
-    } else if (lineAligns[line] === "center") {
-      startX = (LCD_WIDTH - totalUnits * pxPerUnit) / 2;
-    } else if (lineAligns[line] === "right") {
-      startX = LCD_WIDTH - totalUnits * pxPerUnit - 4 * pxPerUnit;
-    } else {
-      startX = 2 * pxPerUnit;
-    }
-
-    let xPos = startX;
-    ctx.textBaseline = "middle";
-
-    for (const seg of segments) {
-      const fs = seg.fs || 0;
-      const charW = FONT_MULTIPLIER[fs] * pxPerUnit;
-      const pxSize = FONT_SIZES[fs];
-      const font = lcdFont(pxSize, seg.inv);
-
-      ctx.font = font;
-
-      if (seg.inv) {
-        ctx.fillStyle = LCD_INV_BG;
-        ctx.fillRect(xPos, y - LCD_LINE_H / 2 + 2, charW, LCD_LINE_H - 4);
-        ctx.fillStyle = LCD_INV_FG;
-      } else {
+    for (const s of segs) {
+      if (s.progress) {
+        const bw = (s.barWidth || 100) * PX_PER_UNIT;
+        const bx = (LCD_W - bw) / 2, by = y - 5;
+        ctx.strokeStyle = LCD_FG; ctx.lineWidth = 1;
+        ctx.strokeRect(bx, by, bw, 10);
         ctx.fillStyle = LCD_FG;
+        ctx.fillRect(bx, by, Math.min(s.value / (s.max || 1), 1) * bw, 10);
+        continue;
       }
 
-      const measured = ctx.measureText(seg.ch).width;
-      const charX = xPos + (charW - measured) / 2;
-      ctx.fillText(seg.ch, charX, y);
+      const chars = s.chars;
+      if (!chars || chars.length === 0) continue;
 
-      xPos += charW;
+      let wUnits = 0;
+      for (const c of chars) wUnits += FONT_MULT[c.fs || 0];
+
+      let xPx;
+      if (s.align === "center") {
+        xPx = (LCD_W - wUnits * PX_PER_UNIT) / 2;
+      } else if (s.align === "right") {
+        xPx = LCD_W - wUnits * PX_PER_UNIT - 4 * PX_PER_UNIT;
+      } else {
+        xPx = s.x * PX_PER_UNIT;
+      }
+
+      ctx.textBaseline = "middle";
+      for (const c of chars) {
+        const cw = FONT_MULT[c.fs || 0] * PX_PER_UNIT;
+        const px = FONT_PX[c.fs || 0];
+        ctx.font = lcdFont(px, c.inv);
+
+        if (c.inv) {
+          ctx.fillStyle = LCD_INV_BG;
+          ctx.fillRect(xPx, y - LCD_LINE_H / 2 + 2, cw, LCD_LINE_H - 4);
+          ctx.fillStyle = LCD_INV_FG;
+        } else {
+          ctx.fillStyle = LCD_FG;
+        }
+
+        const mw = ctx.measureText(c.ch).width;
+        ctx.fillText(c.ch, xPx + (cw - mw) / 2, y);
+        xPx += cw;
+      }
     }
   }
 }
