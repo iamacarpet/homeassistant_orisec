@@ -418,6 +418,7 @@ class OrisecUDPProtocol(asyncio.DatagramProtocol):
     def error_received(self, exc: Exception) -> None:
         _LOGGER.debug("UDP error: %s", exc)
         self.error = exc
+        self.event.set()
 
     def connection_lost(self, exc: Exception | None) -> None:
         pass
