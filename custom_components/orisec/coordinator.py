@@ -16,6 +16,8 @@ from .const import (
     CONFIG_FLOW_GRACE_PERIOD,
     DOMAIN,
     POLL_INTERVAL,
+    RECONNECT_BACKOFF_BASE,
+    RECONNECT_BACKOFF_MAX,
     SETUP_BACKOFF_BASE,
     SETUP_BACKOFF_MAX,
     SETUP_MAX_RETRIES,
@@ -136,6 +138,9 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._lcd_callbacks: list[Callable] = []
 
         self._panel_callbacks: list[Callable] = []
+
+        self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_attempts: int = 0
 
     @property
     def host(self) -> str:
@@ -279,10 +284,20 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.sys_output_state = r.sys_output_state
         self.zone_status = r.zone_status
 
-    async def _async_update_data(self) -> dict[str, Any]:
-        try:
-            if not self.connected:
-                _LOGGER.debug("Connection lost, reconnecting to %s:%s", self._host, self._port)
+    async def _reconnect(self) -> None:
+        while True:
+            self._reconnect_attempts += 1
+            delay = min(
+                RECONNECT_BACKOFF_BASE ** self._reconnect_attempts
+                + random.uniform(0, 1),
+                RECONNECT_BACKOFF_MAX,
+            )
+            _LOGGER.debug(
+                "Reconnect attempt %d in %.1fs for %s:%s",
+                self._reconnect_attempts, delay, self._host, self._port,
+            )
+            await asyncio.sleep(delay)
+            try:
                 await self._conn.disconnect()
                 await asyncio.sleep(CONFIG_FLOW_GRACE_PERIOD)
                 await self._conn.connect()
@@ -290,8 +305,51 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self._do_config()
                 await self._do_initial_data()
                 self._stage = 3
-                _LOGGER.debug("Reconnected successfully")
+                self._reconnect_attempts = 0
+                _LOGGER.info(
+                    "Reconnected to %s:%s after %d attempts",
+                    self._host, self._port, self._reconnect_attempts + 1,
+                )
+                self.async_set_updated_data(self._build_data_dict())
+                return
+            except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
+                _LOGGER.debug("Reconnect attempt %d failed: %s", self._reconnect_attempts, err)
+                try:
+                    await self._conn.disconnect()
+                except Exception:
+                    pass
 
+    def _start_reconnect(self) -> None:
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        self._reconnect_task = self.hass.async_create_task(
+            self._reconnect(), f"orisec_reconnect_{self._host}"
+        )
+
+    def _cancel_reconnect(self) -> None:
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
+
+    def _build_data_dict(self) -> dict[str, Any]:
+        return {
+            "sys_output_state": self.sys_output_state,
+            "zone_status": self.zone_status,
+            "zone_timers": self.zone_timers,
+            "zone_bypass": self.zone_bypass,
+            "rem_output_state": self.rem_output_state,
+        }
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        if not self.connected:
+            if self._reconnect_task is None or self._reconnect_task.done():
+                self._start_reconnect()
+            raise UpdateFailed(
+                f"Not connected to panel at {self._host}:{self._port}, "
+                f"reconnect attempt {self._reconnect_attempts} in progress"
+            )
+
+        try:
             queries: list[tuple[int, int, int]] = [
                 (QUERY_SYS_OUTPUT_STATE, 1, 65),
                 (CMD_PANEL_STATE, 1, 1),
@@ -320,6 +378,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             result = await self._conn.multi_query(queries)
 
+            self._reconnect_attempts = 0
             self.sys_output_state = result.sys_output_state
             if result.zone_status:
                 self.zone_status = result.zone_status
@@ -339,13 +398,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._check_alarm_events()
             self._notify_panel_subscribers()
 
-            return {
-                "sys_output_state": self.sys_output_state,
-                "zone_status": self.zone_status,
-                "zone_timers": self.zone_timers,
-                "zone_bypass": self.zone_bypass,
-                "rem_output_state": self.rem_output_state,
-            }
+            return self._build_data_dict()
 
         except Exception as err:
             self._stage = 0
@@ -353,6 +406,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self._conn.disconnect()
             except Exception:
                 pass
+            self._start_reconnect()
             if isinstance(err, UpdateFailed):
                 raise
             raise UpdateFailed(f"Communication error: {err}") from err
@@ -448,6 +502,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.async_request_refresh()
 
     async def async_shutdown(self) -> None:
+        self._cancel_reconnect()
         await self._conn.disconnect()
         self._stage = 0
 
