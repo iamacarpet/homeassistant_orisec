@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
@@ -12,8 +13,12 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    CONFIG_FLOW_GRACE_PERIOD,
     DOMAIN,
     POLL_INTERVAL,
+    SETUP_BACKOFF_BASE,
+    SETUP_BACKOFF_MAX,
+    SETUP_MAX_RETRIES,
     CMD_LCD,
     QUERY_AREA_ARM_ATT,
     QUERY_AREA_TEXTS,
@@ -141,11 +146,39 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._conn.connected and self._stage >= 3
 
     async def async_setup(self) -> None:
-        await self._conn.connect()
-        await self._do_login()
-        await self._do_config()
-        await self._do_initial_data()
-        self._stage = 3
+        last_err: Exception | None = None
+        for attempt in range(1, SETUP_MAX_RETRIES + 1):
+            try:
+                _LOGGER.debug(
+                    "Setup attempt %d/%d for %s:%s",
+                    attempt, SETUP_MAX_RETRIES, self._host, self._port,
+                )
+                await self._conn.disconnect()
+                await asyncio.sleep(CONFIG_FLOW_GRACE_PERIOD)
+                await self._conn.connect()
+                await self._do_login()
+                await self._do_config()
+                await self._do_initial_data()
+                self._stage = 3
+                _LOGGER.debug("Setup succeeded on attempt %d", attempt)
+                return
+            except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
+                last_err = err
+                _LOGGER.debug(
+                    "Setup attempt %d failed: %s", attempt, err,
+                )
+                try:
+                    await self._conn.disconnect()
+                except Exception:
+                    pass
+                if attempt < SETUP_MAX_RETRIES:
+                    delay = min(
+                        SETUP_BACKOFF_BASE ** attempt + random.uniform(0, 1),
+                        SETUP_BACKOFF_MAX,
+                    )
+                    _LOGGER.debug("Retrying in %.1fs", delay)
+                    await asyncio.sleep(delay)
+        raise last_err  # type: ignore[misc]
 
     async def _do_login(self) -> None:
         result = await self._conn.login(self._password)
@@ -249,12 +282,15 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         try:
             if not self.connected:
+                _LOGGER.debug("Connection lost, reconnecting to %s:%s", self._host, self._port)
                 await self._conn.disconnect()
+                await asyncio.sleep(CONFIG_FLOW_GRACE_PERIOD)
                 await self._conn.connect()
                 await self._do_login()
                 await self._do_config()
                 await self._do_initial_data()
                 self._stage = 3
+                _LOGGER.debug("Reconnected successfully")
 
             queries: list[tuple[int, int, int]] = [
                 (QUERY_SYS_OUTPUT_STATE, 1, 65),

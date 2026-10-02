@@ -46,6 +46,7 @@ from .const import (
     QUERY_UDL_OPTION,
     QUERY_USER_TYPE,
     QUERY_ZONE_STATUS2,
+    SEND_RETRIES,
     UDP_TIMEOUT,
 )
 
@@ -458,23 +459,45 @@ class OrisecConnection:
 
         data = trim_packet(bytearray(packet)) if isinstance(packet, bytes) else trim_packet(packet)
 
-        self._protocol.responses.clear()
-        self._protocol.event.clear()
-        self._protocol.error = None
+        last_error: Exception | None = None
+        for attempt in range(1, SEND_RETRIES + 1):
+            self._protocol.responses.clear()
+            self._protocol.event.clear()
+            self._protocol.error = None
 
-        self._transport.sendto(data)
+            self._transport.sendto(data)
 
-        try:
-            await asyncio.wait_for(self._protocol.event.wait(), self.timeout)
-            await asyncio.sleep(settle_time)
-        except asyncio.TimeoutError:
-            _LOGGER.debug("UDP timeout waiting for response")
-            return []
+            try:
+                await asyncio.wait_for(self._protocol.event.wait(), self.timeout)
+                await asyncio.sleep(settle_time)
+            except asyncio.TimeoutError:
+                _LOGGER.debug(
+                    "UDP timeout (attempt %d/%d)", attempt, SEND_RETRIES
+                )
+                last_error = asyncio.TimeoutError()
+                if attempt < SEND_RETRIES:
+                    await asyncio.sleep(0.3 * attempt)
+                continue
 
-        if self._protocol.error:
-            raise ConnectionError(f"UDP error: {self._protocol.error}")
+            if self._protocol.error:
+                last_error = ConnectionError(f"UDP error: {self._protocol.error}")
+                _LOGGER.debug(
+                    "UDP error (attempt %d/%d): %s",
+                    attempt, SEND_RETRIES, self._protocol.error,
+                )
+                if attempt < SEND_RETRIES:
+                    await asyncio.sleep(0.3 * attempt)
+                continue
 
-        return self._protocol.responses[:]
+            return self._protocol.responses[:]
+
+        _LOGGER.warning(
+            "UDP send_receive failed after %d attempts to %s:%s",
+            SEND_RETRIES, self.host, self.port,
+        )
+        if isinstance(last_error, ConnectionError):
+            raise last_error
+        return []
 
     async def login(self, password: str) -> ParsedResponse:
         pkt = build_login_packet(password)
