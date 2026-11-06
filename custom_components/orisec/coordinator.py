@@ -105,6 +105,12 @@ _METADATA_FIELDS = (
 )
 _METADATA_BYTES_FIELDS = ("zone_types", "zone_areas")
 
+_PANEL_ERRORS = {3: "password rejected", 4: "not logged in", 5: "command not supported"}
+
+
+def _describe_panel_error(code: int | None) -> str:
+    return f"error {code}: {_PANEL_ERRORS[code]}" if code in _PANEL_ERRORS else f"error {code}"
+
 
 class PanelSessionError(UpdateFailed):
     """The panel answered with an error instead of status, e.g. because the login expired."""
@@ -804,12 +810,29 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if len(self._event_log) > 20:
             self._event_log = self._event_log[-20:]
 
+    async def _login_for_command(self) -> None:
+        # The panel has one login shared by every client, and status polls keep working without
+        # ours. Since connecting, the app may have logged in as another user or the session may
+        # have lapsed, so commands would run under someone else's session or none.
+        try:
+            result = await self._conn.login(self._password)
+        except ConnectionError as err:
+            raise HomeAssistantError(
+                f"Could not log in to the alarm panel, so the command was not sent: {err}"
+            ) from err
+        if not result.logged_in:
+            raise HomeAssistantError(
+                "The alarm panel refused the login "
+                f"({_describe_panel_error(result.error)}), so the command was not sent"
+            )
+
     async def async_send_keypress(self, key_code: int, area_mask: int) -> None:
         # Not just the socket: an open socket without a logged-in session must not send keys.
         if not self.connected:
             raise ConnectionError(self._not_connected_message())
+        await self._login_for_command()
         try:
-            await self._conn.send_keypress(key_code, area_mask)
+            result = await self._conn.send_keypress(key_code, area_mask)
         except PanelNoResponseError as err:
             # Sent once only: the ack may be what got lost, so re-read rather than resend.
             await self.async_request_refresh()
@@ -817,6 +840,11 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "The alarm panel did not acknowledge the command. It may still have "
                 "been applied; check the alarm state before trying again."
             ) from err
+        if result.error is not None:
+            raise HomeAssistantError(
+                "The alarm panel rejected the command "
+                f"({_describe_panel_error(result.error)})"
+            )
         await asyncio.sleep(0.5)
         await self.async_request_refresh()
 
@@ -836,14 +864,20 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         current = 0
         if output_index < len(self.rem_output_state):
             current = self.rem_output_state[output_index]
+        await self._login_for_command()
         try:
-            await self._conn.toggle_output(output_index, current)
+            result = await self._conn.toggle_output(output_index, current)
         except PanelNoResponseError as err:
             await self.async_request_refresh()
             raise HomeAssistantError(
                 "The alarm panel did not acknowledge the output change. It may still "
                 "have been applied; check the output state before trying again."
             ) from err
+        if result.error is not None:
+            raise HomeAssistantError(
+                "The alarm panel rejected the output change "
+                f"({_describe_panel_error(result.error)})"
+            )
         await asyncio.sleep(0.3)
         r = await self._conn.query(
             QUERY_REM_OUTPUT_STATE, 1, self.max_rem_outputs + 1

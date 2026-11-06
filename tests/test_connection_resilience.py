@@ -1337,12 +1337,93 @@ class TestCommandsSentOnce(unittest.TestCase):
 
             coord = _connected_coordinator()
             coord.async_request_refresh = AsyncMock()
+            coord._conn.login = AsyncMock(return_value=ParsedResponse(logged_in=True))
             coord._conn.send_keypress = AsyncMock(side_effect=PanelNoResponseError("silent"))
 
             with self.assertRaises(HomeAssistantError):
                 await coord.async_arm_away(0x01)
             coord._conn.send_keypress.assert_awaited_once()
             coord.async_request_refresh.assert_awaited_once()
+
+        run_async(_test())
+
+    def test_commands_log_in_again_before_sending(self):
+        async def _test():
+            # The panel's login is shared; the app may have replaced ours since we connected.
+            coord = _connected_coordinator()
+            coord.async_request_refresh = AsyncMock()
+            calls = []
+            coord._conn.login = AsyncMock(
+                side_effect=lambda pw: calls.append(("login", pw)) or ParsedResponse(logged_in=True)
+            )
+            coord._conn.send_keypress = AsyncMock(
+                side_effect=lambda key, mask: calls.append(("key", key, mask)) or ParsedResponse()
+            )
+            coord._conn.toggle_output = AsyncMock(
+                side_effect=lambda idx, cur: calls.append(("output", idx)) or ParsedResponse()
+            )
+            coord._conn.query = AsyncMock(return_value=ParsedResponse())
+
+            with patch("asyncio.sleep", new=AsyncMock()):
+                await coord.async_arm_away(0x01)
+                await coord.async_toggle_output(0)
+
+            self.assertEqual(calls, [
+                ("login", "1234"), ("key", 0, 0x01),
+                ("login", "1234"), ("output", 0),
+            ])
+
+        run_async(_test())
+
+    def test_command_is_not_sent_when_login_fails(self):
+        async def _test():
+            from homeassistant.exceptions import HomeAssistantError
+
+            coord = _connected_coordinator()
+            coord._conn.send_keypress = AsyncMock()
+
+            coord._conn.login = AsyncMock(return_value=ParsedResponse(error=3))
+            with self.assertRaisesRegex(HomeAssistantError, "password rejected"):
+                await coord.async_arm_away(0x01)
+
+            coord._conn.login = AsyncMock(side_effect=PanelNoResponseError("silent"))
+            with self.assertRaisesRegex(HomeAssistantError, "not sent"):
+                await coord.async_arm_away(0x01)
+
+            coord._conn.send_keypress.assert_not_called()
+
+        run_async(_test())
+
+    def test_rejected_arm_is_reported_not_treated_as_success(self):
+        async def _test():
+            from homeassistant.exceptions import HomeAssistantError
+
+            coord = _connected_coordinator()
+            coord._conn.login = AsyncMock(return_value=ParsedResponse(logged_in=True))
+            coord._conn.send_keypress = AsyncMock(return_value=ParsedResponse(error=4))
+            coord._conn.toggle_output = AsyncMock(return_value=ParsedResponse(error=5))
+
+            with self.assertRaisesRegex(HomeAssistantError, "rejected.*not logged in"):
+                await coord.async_arm_away(0x01)
+            with self.assertRaisesRegex(HomeAssistantError, "rejected.*not supported"):
+                await coord.async_toggle_output(0)
+            coord._conn.send_keypress.assert_awaited_once()
+
+        run_async(_test())
+
+    def test_error_reply_to_keypress_counts_as_its_answer(self):
+        async def _test():
+            from custom_components.orisec.const import CMD_ERROR
+
+            conn, proto = _bare_connection()
+            conn._transport.sendto = MagicMock(
+                side_effect=lambda data: proto.datagram_received(
+                    _reply((CMD_ERROR, bytes([4]))), None
+                )
+            )
+
+            result = await conn.send_keypress(0, 0x01)
+            self.assertEqual(result.error, 4)
 
         run_async(_test())
 
