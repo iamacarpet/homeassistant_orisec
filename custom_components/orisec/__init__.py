@@ -14,6 +14,7 @@ from homeassistant.components.panel_custom import async_register_panel
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .const import DOMAIN, PLATFORMS, CONF_PANEL_IP, CONF_PANEL_PORT, CONF_PASSWORD
@@ -24,6 +25,7 @@ _LOGGER = logging.getLogger(__name__)
 _CARD_URL = "/orisec_panel/orisec-alarm-panel-card.js"
 _KEYPAD_CARD_URL = "/orisec_panel/orisec-keypad-card.js"
 _WWW_DIR = Path(__file__).parent / "www"
+_STORAGE_VERSION = 1
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -63,10 +65,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         password=entry.data[CONF_PASSWORD],
     )
 
-    try:
-        await coordinator.async_setup()
-    except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
-        raise ConfigEntryNotReady(f"Cannot connect to Orisec panel: {err}") from err
+    host = entry.data[CONF_PANEL_IP]
+    port = entry.data[CONF_PANEL_PORT]
+    store = _metadata_store(hass, entry)
+    cached = await store.async_load()
+    coordinator.on_metadata_updated = lambda: store.async_delay_save(
+        coordinator.export_metadata
+    )
+
+    if cached:
+        # Don't hold up HA startup on the panel: build entities from the last known
+        # configuration and connect in the background, refreshing the cache once it answers.
+        coordinator.restore_metadata(cached)
+        coordinator.async_connect_in_background()
+    else:
+        try:
+            await coordinator.async_setup()
+        except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
+            # Release the fixed local port, or HA's retry falls back to a random one the panel refuses.
+            await coordinator.async_shutdown()
+            _LOGGER.warning(
+                "Failed to connect to Orisec panel at %s:%s: %s", host, port, err,
+            )
+            raise ConfigEntryNotReady(
+                f"Cannot connect to Orisec panel at {host}:{port}: {err}"
+            ) from err
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
@@ -84,6 +107,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_shutdown()
 
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    await _metadata_store(hass, entry).async_remove()
+
+
+def _metadata_store(hass: HomeAssistant, entry: ConfigEntry) -> Store[dict]:
+    return Store(hass, _STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}")
 
 
 def _get_coordinator(

@@ -52,6 +52,11 @@ class OrisecPanelInfoSensor(CoordinatorEntity[OrisecCoordinator], SensorEntity):
         }
 
     @property
+    def available(self) -> bool:
+        # Stays available while the panel is offline, so its attributes can say why.
+        return True
+
+    @property
     def native_value(self) -> str:
         return "online" if self.coordinator.connected else "offline"
 
@@ -71,6 +76,7 @@ class OrisecPanelInfoSensor(CoordinatorEntity[OrisecCoordinator], SensorEntity):
             "trouble": bool(sos[SOS_TROUBLE] & 0xFF) if sos else False,
             "engineer_required": bool(sos[SOS_CALL_ENGINEER] & 0xFF) if sos else False,
         }
+        attrs.update(self.coordinator.connection_stats)
 
         if self.coordinator.area_names:
             for i, name in enumerate(self.coordinator.area_names):

@@ -19,6 +19,7 @@ _ha_ce = types.ModuleType("homeassistant.config_entries")
 _ha_huc = types.ModuleType("homeassistant.helpers.update_coordinator")
 _ha_helpers = types.ModuleType("homeassistant.helpers")
 _ha_ep = types.ModuleType("homeassistant.helpers.entity_platform")
+_ha_storage = types.ModuleType("homeassistant.helpers.storage")
 _ha_const = types.ModuleType("homeassistant.const")
 
 class _FakeConfigEntry:
@@ -34,6 +35,7 @@ _ha_core.callback = lambda f: f
 _ha_huc.DataUpdateCoordinator = _FakeDataUpdateCoordinator
 _ha_huc.UpdateFailed = Exception
 _ha_ep.AddEntitiesCallback = None
+_ha_storage.Store = None
 _ha_const.CONF_HOST = "host"
 _ha_const.CONF_PORT = "port"
 _ha_const.CONF_PASSWORD = "password"
@@ -45,6 +47,7 @@ for mod_name, mod in [
     ("homeassistant.helpers", _ha_helpers),
     ("homeassistant.helpers.update_coordinator", _ha_huc),
     ("homeassistant.helpers.entity_platform", _ha_ep),
+    ("homeassistant.helpers.storage", _ha_storage),
     ("homeassistant.const", _ha_const),
 ]:
     sys.modules[mod_name] = mod

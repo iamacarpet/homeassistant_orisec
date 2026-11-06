@@ -14,6 +14,8 @@
     "error": {
       "cannot_connect": "Unable to connect to the panel. Check the IP address and port.",
       "invalid_auth": "Invalid password. Please check your panel password.",
+      "panel_refused": "The panel refused the connection (its network module isn't accepting connections on that port). Check the port number, and if it is right, wait a few minutes in case the module is restarting.",
+      "port_in_use": "The local UDP port Home Assistant uses for this panel is already in use, usually because this panel is already set up, either in this Home Assistant or in another instance on the same host.",
       "unknown": "An unexpected error occurred."
     },
     "abort": {

@@ -126,6 +126,9 @@ class OrisecAlarmPanel(CoordinatorEntity[OrisecCoordinator], AlarmControlPanelEn
             "bell": bool(sos[SOS_BELL] & area_bit),
             "ac_fault": bool(sos[SOS_AC_FAULT] & area_bit),
             "battery_fault": bool(sos[SOS_BATTERY_FAULT] & area_bit),
+            # False while failed polls are ridden out on the last state the panel reported.
+            "state_confirmed": self.coordinator.state_confirmed,
+            "state_cached_since": self.coordinator.state_cached_since,
         }
         # Surface the panel's own names for each arm mode so users know what
         # "Away / Home / Night / Vacation" actually means on their system.

@@ -4,9 +4,32 @@ from __future__ import annotations
 
 DOMAIN = "orisec"
 DEFAULT_PORT = 20202
-POLL_INTERVAL = 2
-UDP_TIMEOUT = 3.0
+POLL_INTERVAL = 5
+KEYPAD_POLL_INTERVAL = 2
+# Per attempt. The panel answers in ~0.1-0.3 s, but a reply is lost (not late) when another
+# local client sends at the same moment, so a long wait only delays the retry.
+UDP_TIMEOUT = 1.0
+# Commands are sent once, so their ack gets longer before being reported as missing.
+COMMAND_TIMEOUT = 3.0
 MAX_LOGIN_RETRIES = 3
+SEND_RETRIES = 3
+# Seconds of unanswered polls tolerated (entities keep last state) before going offline.
+POLL_FAILURE_GRACE = 30.0
+SETUP_CONNECT_TIMEOUT = 10.0
+SETUP_MAX_RETRIES = 3
+SETUP_BACKOFF_BASE = 2.0
+SETUP_BACKOFF_MAX = 15.0
+CONFIG_FLOW_GRACE_PERIOD = 1.0
+RECONNECT_BACKOFF_BASE = 2.0
+RECONNECT_BACKOFF_MAX = 60.0
+REFUSED_BACKOFF_BASE = 30.0
+REFUSED_BACKOFF_MAX = 600.0
+LOCAL_PORT_BASE = 21000
+LOCAL_PORT_RANGE = 1000
+# Debug messages that would repeat every poll are logged at most this often per kind.
+DEBUG_LOG_INTERVAL = 60.0
+# Connection events (unavailable, reconnect attempts, ...) kept for the diagnostics download.
+DIAGNOSTIC_HISTORY_SIZE = 30
 
 CONF_PANEL_IP = "panel_ip"
 CONF_PANEL_PORT = "panel_port"

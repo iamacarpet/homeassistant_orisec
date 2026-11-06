@@ -12,7 +12,7 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_PASSWORD
 
 from .const import DOMAIN, DEFAULT_PORT, CONF_PANEL_IP, CONF_PANEL_PORT, CONF_PASSWORD as ORISEC_CONF_PASSWORD
-from .protocol import OrisecConnection
+from .protocol import LocalPortInUseError, OrisecConnection, PanelRefusedError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +65,12 @@ class OrisecConfigFlow(ConfigFlow, domain=DOMAIN):
                             CONF_PASSWORD: password,
                         },
                     )
+            except LocalPortInUseError as err:
+                _LOGGER.warning("%s", err)
+                errors["base"] = "port_in_use"
+            except PanelRefusedError as err:
+                _LOGGER.warning("%s", err)
+                errors["base"] = "panel_refused"
             except (ConnectionError, OSError, asyncio.TimeoutError):
                 errors["base"] = "cannot_connect"
             finally:

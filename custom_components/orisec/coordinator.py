@@ -4,16 +4,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import time
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    COMMAND_TIMEOUT,
+    CONFIG_FLOW_GRACE_PERIOD,
+    DIAGNOSTIC_HISTORY_SIZE,
     DOMAIN,
+    KEYPAD_POLL_INTERVAL,
+    POLL_FAILURE_GRACE,
     POLL_INTERVAL,
+    RECONNECT_BACKOFF_BASE,
+    RECONNECT_BACKOFF_MAX,
+    REFUSED_BACKOFF_BASE,
+    REFUSED_BACKOFF_MAX,
+    SETUP_BACKOFF_BASE,
+    SETUP_BACKOFF_MAX,
+    SETUP_MAX_RETRIES,
+    UDP_TIMEOUT,
     CMD_LCD,
     QUERY_AREA_ARM_ATT,
     QUERY_AREA_TEXTS,
@@ -63,16 +80,88 @@ from .const import (
     ZONE_TYPE_NOT_USED,
 )
 from .protocol import (
+    LocalPortInUseError,
     OrisecConnection,
+    PanelNoResponseError,
+    PanelRefusedError,
+    PanelUDPError,
     ParsedResponse,
     add_udl_pkt,
     load_udl_pkt,
     parse_responses,
 )
+from .throttled_log import ThrottledLog
 
 _LOGGER = logging.getLogger(__name__)
+_THROTTLED = ThrottledLog(_LOGGER)
 
 SETUP_RETRY_DELAY = 5
+
+# Panel configuration that shapes the entities; cached so HA can start without the panel.
+_METADATA_FIELDS = (
+    "panel_type", "panel_version", "serial", "max_zones", "max_areas",
+    "max_rem_outputs", "part_arm_mask", "user_area", "user_number",
+    "zone_names", "area_names", "rem_output_names", "part_arm_names",
+)
+_METADATA_BYTES_FIELDS = ("zone_types", "zone_areas")
+
+_PANEL_ERRORS = {3: "password rejected", 4: "not logged in", 5: "command not supported"}
+
+
+def _describe_panel_error(code: int | None) -> str:
+    return f"error {code}: {_PANEL_ERRORS[code]}" if code in _PANEL_ERRORS else f"error {code}"
+
+
+class PanelSessionError(UpdateFailed):
+    """The panel answered with an error instead of status, e.g. because the login expired."""
+
+
+class PanelLoginError(UpdateFailed):
+    """The panel rejected the login."""
+
+
+class PanelInvalidReplyError(UpdateFailed):
+    """The panel replied, but without the status data that was asked for."""
+
+
+def failure_category(err: BaseException) -> str:
+    """Name what kind of failure an error is, to tell apart the causes of an outage.
+
+    no_response: requests went out but nothing usable came back (lost or dropped replies).
+    refused: the panel's IP module answered ICMP port-unreachable.
+    udp_error: the host couldn't send or got a network error (e.g. no route).
+    port_in_use: the fixed local port is held by another socket, so nothing was sent.
+    session_error / login_rejected / invalid_reply: the panel answered, but not with data.
+    """
+    if isinstance(err, LocalPortInUseError):
+        return "port_in_use"
+    if isinstance(err, PanelRefusedError):
+        return "refused"
+    if isinstance(err, PanelUDPError):
+        return "udp_error"
+    if isinstance(err, (PanelNoResponseError, asyncio.TimeoutError)):
+        return "no_response"
+    if isinstance(err, PanelSessionError):
+        return "session_error"
+    if isinstance(err, PanelLoginError):
+        return "login_rejected"
+    if isinstance(err, PanelInvalidReplyError):
+        return "invalid_reply"
+    if isinstance(err, OSError):
+        # Includes ConnectionError, e.g. "Not connected" when the socket is gone.
+        return "socket_error"
+    return "error"
+
+
+def describe_failure(err: BaseException) -> str:
+    return f"{failure_category(err)}: {err or type(err).__name__}"
+
+
+def _timestamp(when: float | None) -> str | None:
+    """Local time with UTC offset, matching the clock Home Assistant's log uses."""
+    if when is None:
+        return None
+    return datetime.fromtimestamp(when).astimezone().isoformat(timespec="milliseconds")
 
 
 class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -132,6 +221,31 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._panel_callbacks: list[Callable] = []
 
+        self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_attempts: int = 0
+        self._last_error_refused: bool = False
+        self._last_poll_ok: float = time.monotonic()
+        self._consecutive_failures: int = 0
+        self._connection_drops: int = 0
+        self._last_error: str | None = None
+
+        # Diagnostics. Times are wall-clock (time.time()).
+        self._polls: int = 0
+        self._last_poll_at: float | None = None
+        # When the panel's status block was last read and applied: entity state is
+        # confirmed by the panel only as of this time.
+        self._last_status_at: float | None = None
+        self._session_errors: int = 0
+        self._last_unavailable_at: float | None = None
+        self._last_unavailable_reason: str | None = None
+        self._last_reconnect_at: float | None = None
+        self._last_reconnect_reason: str | None = None
+        self._history: deque[dict[str, Any]] = deque(maxlen=DIAGNOSTIC_HISTORY_SIZE)
+
+        # False until names/types are read from the panel in this run (a cache restore doesn't count).
+        self._metadata_fresh: bool = False
+        self.on_metadata_updated: Callable[[], None] | None = None
+
     @property
     def host(self) -> str:
         return self._host
@@ -141,19 +255,59 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._conn.connected and self._stage >= 3
 
     async def async_setup(self) -> None:
-        await self._conn.connect()
+        last_err: Exception | None = None
+        for attempt in range(1, SETUP_MAX_RETRIES + 1):
+            try:
+                _LOGGER.debug(
+                    "Setup attempt %d/%d for %s:%s",
+                    attempt, SETUP_MAX_RETRIES, self._host, self._port,
+                )
+                if attempt == 1:
+                    await asyncio.sleep(CONFIG_FLOW_GRACE_PERIOD)
+                await self._connect_and_load()
+                _LOGGER.debug("Setup succeeded on attempt %d", attempt)
+                return
+            except PanelRefusedError:
+                raise
+            except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
+                last_err = err
+                _LOGGER.debug(
+                    "Setup attempt %d failed: %s", attempt, err,
+                )
+                if attempt < SETUP_MAX_RETRIES:
+                    delay = min(
+                        SETUP_BACKOFF_BASE ** attempt + random.uniform(0, 1),
+                        SETUP_BACKOFF_MAX,
+                    )
+                    _LOGGER.debug("Retrying in %.1fs", delay)
+                    await asyncio.sleep(delay)
+        raise last_err  # type: ignore[misc]
+
+    async def _connect_and_load(self, fresh_socket: bool = False) -> None:
+        if fresh_socket:
+            await self._conn.reconnect()
+        else:
+            await self._conn.connect()
         await self._do_login()
         await self._do_config()
-        await self._do_initial_data()
+        if self._metadata_fresh:
+            # Names don't change between reconnects; only fetch live state.
+            await self._do_status()
+        else:
+            await self._do_initial_data()
+            self._metadata_fresh = True
+            if self.on_metadata_updated is not None:
+                self.on_metadata_updated()
         self._stage = 3
+        self._poll_succeeded()
 
     async def _do_login(self) -> None:
         result = await self._conn.login(self._password)
         if not result.logged_in:
             err = result.error
             if err == 3:
-                raise UpdateFailed("Password rejected by panel")
-            raise UpdateFailed(f"Login failed (error={err})")
+                raise PanelLoginError("Password rejected by panel")
+            raise PanelLoginError(f"Login failed (error={err})")
 
         self.panel_type = result.panel_type
         self.panel_version = result.panel_version
@@ -165,8 +319,9 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.user_area = result.user_area
         self.user_number = result.user_number
         _LOGGER.info(
-            "Login OK: panel=%s max_zones=%d max_areas=%d user_area=0x%X user=%d",
-            self.panel_type, self.max_zones, self.max_areas,
+            "Login OK from local UDP port %s: panel=%s max_zones=%d max_areas=%d "
+            "user_area=0x%X user=%d",
+            self._conn.bound_port, self.panel_type, self.max_zones, self.max_areas,
             self.user_area, self.user_number,
         )
 
@@ -243,19 +398,145 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             (QUERY_ZONE_STATUS, 1, self.max_zones),
         ])
         self.part_arm_names = r.part_arm_names
-        self.sys_output_state = r.sys_output_state
-        self.zone_status = r.zone_status
+        self._apply_status(r)
+
+    async def _do_status(self) -> None:
+        r = await self._conn.multi_query([
+            (QUERY_SYS_OUTPUT_STATE, 1, 65),
+            (CMD_PANEL_STATE, 1, 1),
+            (QUERY_ZONE_STATUS, 1, self.max_zones),
+        ])
+        self._apply_status(r)
+
+    def _apply_status(self, result: ParsedResponse) -> None:
+        # A reply without the status block (e.g. an expired login) must not read as all-zero state.
+        if not result.has_command(QUERY_SYS_OUTPUT_STATE):
+            if result.error is not None:
+                self._session_errors += 1
+                raise PanelSessionError(
+                    f"Panel answered with error {result.error} instead of status data"
+                )
+            raise PanelInvalidReplyError(
+                f"Panel replied without status data (error={result.error})"
+            )
+        self.sys_output_state = result.sys_output_state
+        if result.zone_status:
+            self.zone_status = result.zone_status
+        self._last_status_at = time.time()
+
+    def export_metadata(self) -> dict[str, Any]:
+        data: dict[str, Any] = {f: getattr(self, f) for f in _METADATA_FIELDS}
+        data.update({f: list(getattr(self, f)) for f in _METADATA_BYTES_FIELDS})
+        return data
+
+    def restore_metadata(self, data: dict[str, Any]) -> None:
+        for f in (*_METADATA_FIELDS, *_METADATA_BYTES_FIELDS):
+            if f not in data:
+                _LOGGER.debug("Cached metadata missing field %s; will refresh from panel", f)
+            elif f in _METADATA_BYTES_FIELDS:
+                setattr(self, f, bytes(data[f]))
+            else:
+                setattr(self, f, data[f])
+
+    @callback
+    def async_connect_in_background(self) -> None:
+        """Start with entities unavailable and keep trying the panel until it answers."""
+        self._stage = 0
+        self.last_update_success = False
+        self._mark_unavailable("startup: waiting for the panel, entities built from cache")
+        self._start_reconnect()
+
+    def _backoff_delay(self, attempt: int) -> float:
+        if self._last_error_refused:
+            delay = min(REFUSED_BACKOFF_BASE * 2 ** (attempt - 1), REFUSED_BACKOFF_MAX)
+        else:
+            delay = min(RECONNECT_BACKOFF_BASE ** attempt, RECONNECT_BACKOFF_MAX)
+        return delay + random.uniform(0, 1)
+
+    async def _reconnect(self) -> None:
+        # Each attempt is made because of the outage, then because the previous attempt failed.
+        reason = self._last_unavailable_reason or "not connected"
+        while True:
+            self._reconnect_attempts += 1
+            delay = self._backoff_delay(self._reconnect_attempts)
+            _LOGGER.debug(
+                "Reconnect attempt %d in %.1fs for %s:%s (reason: %s)",
+                self._reconnect_attempts, delay, self._host, self._port, reason,
+            )
+            await asyncio.sleep(delay)
+            self._last_reconnect_at = time.time()
+            self._last_reconnect_reason = reason
+            try:
+                # The session is already known to be lost, so don't trust the old socket:
+                # rebuild it on the same local port, which the panel still recognises.
+                await self._connect_and_load(fresh_socket=True)
+                _LOGGER.info(
+                    "Reconnected to %s:%s from %s after %d attempts",
+                    self._host, self._port, self._conn.local_endpoint,
+                    self._reconnect_attempts,
+                )
+                self._record("reconnected", f"attempt {self._reconnect_attempts}")
+                self._reconnect_attempts = 0
+                self._last_error_refused = False
+                self.async_set_updated_data(self._build_data_dict())
+                return
+            except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
+                self._last_error_refused = isinstance(err, PanelRefusedError)
+                self._last_error = str(err) or type(err).__name__
+                reason = describe_failure(err)
+                self._record(
+                    "reconnect_failed", f"attempt {self._reconnect_attempts}: {reason}"
+                )
+                if isinstance(err, PanelRefusedError):
+                    _LOGGER.warning(
+                        "%s; backing off before attempt %d",
+                        err, self._reconnect_attempts + 1,
+                    )
+                elif isinstance(err, LocalPortInUseError):
+                    _LOGGER.warning(
+                        "Reconnect attempt %d failed: %s", self._reconnect_attempts, err,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Reconnect attempt %d failed: %s", self._reconnect_attempts, reason,
+                    )
+                # HA only notifies entities when a poll's outcome changes, so the Panel Info
+                # sensor wouldn't otherwise show how the outage is going.
+                self.async_update_listeners()
+
+    def _start_reconnect(self) -> None:
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        self._reconnect_task = self.hass.async_create_task(
+            self._reconnect(), f"orisec_reconnect_{self._host}"
+        )
+
+    def _cancel_reconnect(self) -> None:
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
+
+    def _build_data_dict(self) -> dict[str, Any]:
+        return {
+            "sys_output_state": self.sys_output_state,
+            "zone_status": self.zone_status,
+            "zone_timers": self.zone_timers,
+            "zone_bypass": self.zone_bypass,
+            "rem_output_state": self.rem_output_state,
+        }
 
     async def _async_update_data(self) -> dict[str, Any]:
-        try:
-            if not self.connected:
-                await self._conn.disconnect()
-                await self._conn.connect()
-                await self._do_login()
-                await self._do_config()
-                await self._do_initial_data()
-                self._stage = 3
+        self._polls += 1
+        self._last_poll_at = time.time()
+        if not self.connected:
+            if self._reconnect_task is None or self._reconnect_task.done():
+                self._start_reconnect()
+            raise UpdateFailed(
+                f"Not connected to panel at {self._host}:{self._port}, "
+                f"reconnect attempt {self._reconnect_attempts} in progress"
+            )
 
+        try:
             queries: list[tuple[int, int, int]] = [
                 (QUERY_SYS_OUTPUT_STATE, 1, 65),
                 (CMD_PANEL_STATE, 1, 1),
@@ -283,10 +564,14 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._poll_index += 1
 
             result = await self._conn.multi_query(queries)
+            self._apply_status(result)
 
-            self.sys_output_state = result.sys_output_state
-            if result.zone_status:
-                self.zone_status = result.zone_status
+            if self._consecutive_failures:
+                self._record(
+                    "state_confirmed", f"after {self._consecutive_failures} failed poll(s)"
+                )
+            self._poll_succeeded()
+            self._reconnect_attempts = 0
             if result.zone_timers:
                 self.zone_timers = result.zone_timers
             if result.zone_bypass:
@@ -303,23 +588,169 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._check_alarm_events()
             self._notify_panel_subscribers()
 
-            return {
-                "sys_output_state": self.sys_output_state,
-                "zone_status": self.zone_status,
-                "zone_timers": self.zone_timers,
-                "zone_bypass": self.zone_bypass,
-                "rem_output_state": self.rem_output_state,
-            }
+            return self._build_data_dict()
 
         except Exception as err:
+            self._consecutive_failures += 1
+            self._last_error = str(err) or type(err).__name__
+            # A refusal or an error reply means the session is gone; anything else
+            # (lost datagrams) is ridden out on the last known state for a while.
+            session_lost = isinstance(err, (PanelRefusedError, PanelSessionError))
+            silent_for = time.monotonic() - self._last_poll_ok
+            if not session_lost and silent_for < POLL_FAILURE_GRACE:
+                if self._consecutive_failures == 1:
+                    self._record("state_unconfirmed", describe_failure(err))
+                _THROTTLED.debug(
+                    "poll_failed",
+                    "Poll failed (%d in a row, %.0fs since last good poll), "
+                    "keeping last state: %s",
+                    self._consecutive_failures, silent_for, describe_failure(err),
+                )
+                return self._build_data_dict()
             self._stage = 0
-            try:
-                await self._conn.disconnect()
-            except Exception:
-                pass
+            self._connection_drops += 1
+            self._last_error_refused = isinstance(err, PanelRefusedError)
+            if session_lost:
+                reason = describe_failure(err)
+            else:
+                reason = (
+                    f"{failure_category(err)}: no good poll for {silent_for:.0f}s "
+                    f"({self._consecutive_failures} failed in a row); last error: "
+                    f"{err or type(err).__name__}"
+                )
+            self._mark_unavailable(reason)
+            _LOGGER.info(
+                "Marking panel at %s:%s unavailable and reconnecting: %s",
+                self._host, self._port, reason,
+            )
+            self._start_reconnect()
             if isinstance(err, UpdateFailed):
                 raise
             raise UpdateFailed(f"Communication error: {err}") from err
+
+    def _not_connected_message(self) -> str:
+        msg = f"Not connected to panel at {self._host}:{self._port}"
+        if self._last_error:
+            msg += f" (last error: {self._last_error})"
+        return msg
+
+    def _poll_succeeded(self) -> None:
+        self._last_poll_ok = time.monotonic()
+        self._consecutive_failures = 0
+
+    def _mark_unavailable(self, reason: str) -> None:
+        self._last_unavailable_at = time.time()
+        self._last_unavailable_reason = reason
+        self._record("unavailable", reason)
+
+    def _record(self, event: str, detail: str) -> None:
+        self._history.append({"at": time.time(), "event": event, "detail": detail})
+
+    @property
+    def connection_status(self) -> str:
+        """connected, degraded (riding out failed polls on cached state), reconnecting or disconnected."""
+        if self.connected:
+            return "degraded" if self._consecutive_failures else "connected"
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return "reconnecting"
+        return "disconnected"
+
+    @property
+    def state_confirmed(self) -> bool:
+        """True when entity state comes from the latest poll, not from a cached earlier reply."""
+        return self.connection_status == "connected"
+
+    @property
+    def state_cached_since(self) -> str | None:
+        """When the panel last confirmed the state being shown, if it isn't confirmed now."""
+        if self.state_confirmed:
+            return None
+        return _timestamp(self._last_status_at)
+
+    @property
+    def connection_stats(self) -> dict[str, Any]:
+        """Entity attributes for diagnosing an unreliable link.
+
+        Kept to values that change only when something goes wrong, so a healthy link
+        doesn't write a new state on every poll; see diagnostics() for the rest.
+        """
+        return {
+            "status": self.connection_status,
+            "state_confirmed": self.state_confirmed,
+            "state_cached_since": self.state_cached_since,
+            "local_endpoint": self._conn.local_endpoint,
+            "remote_endpoint": self._conn.remote_endpoint,
+            # Should equal the expected port whenever connected; None while disconnected.
+            "local_port": self._conn.bound_port,
+            "expected_local_port": self._conn.local_port,
+            **self._conn.stats,
+            "consecutive_timeouts": self._conn.consecutive_timeouts,
+            "session_errors": self._session_errors,
+            "reconnect_attempts": self._reconnect_attempts,
+            "connection_drops": self._connection_drops,
+            "consecutive_failures": self._consecutive_failures,
+            "last_error": self._last_error,
+            "last_unavailable_at": _timestamp(self._last_unavailable_at),
+            "last_unavailable_reason": self._last_unavailable_reason,
+            "last_reconnect_at": _timestamp(self._last_reconnect_at),
+            "last_reconnect_reason": self._last_reconnect_reason,
+        }
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Everything known about the link, for the diagnostics download. Holds no PIN."""
+        conn = self._conn
+        response_time = conn.last_response_time
+        return {
+            "status": self.connection_status,
+            "entities_available": self.last_update_success,
+            "state_confirmed": self.state_confirmed,
+            "state_cached_since": self.state_cached_since,
+            "stage": self._stage,
+            "metadata_source": "panel" if self._metadata_fresh else "cache",
+            "endpoints": {
+                "local": conn.local_endpoint,
+                "remote": conn.remote_endpoint,
+                "expected_local_port": conn.local_port,
+            },
+            "timestamps": {
+                # The coordinator asked for data (stops moving if polling has stopped).
+                "last_poll_started": _timestamp(self._last_poll_at),
+                # A datagram went out (stops moving if nothing is being sent).
+                "last_request_sent": _timestamp(conn.last_request_at),
+                # Any usable reply came back (last successful communication).
+                "last_reply_received": _timestamp(conn.last_reply_at),
+                # The panel's status was read and applied (last confirmed panel state).
+                "last_confirmed_state": _timestamp(self._last_status_at),
+                "last_unavailable": _timestamp(self._last_unavailable_at),
+                "last_reconnect_attempt": _timestamp(self._last_reconnect_at),
+            },
+            "counters": {
+                "polls": self._polls,
+                **conn.traffic,
+                **conn.stats,
+                "consecutive_timeouts": conn.consecutive_timeouts,
+                "consecutive_failed_polls": self._consecutive_failures,
+                "session_errors": self._session_errors,
+                "connection_drops": self._connection_drops,
+                "reconnect_attempts": self._reconnect_attempts,
+            },
+            "last_response_time_ms": (
+                None if response_time is None else round(response_time * 1000)
+            ),
+            "last_error": self._last_error,
+            "last_udp_error": conn.last_udp_error,
+            "last_unavailable_reason": self._last_unavailable_reason,
+            "last_reconnect_reason": self._last_reconnect_reason,
+            "settings": {
+                "poll_interval_s": self.update_interval.total_seconds(),
+                "udp_timeout_s": UDP_TIMEOUT,
+                "command_timeout_s": COMMAND_TIMEOUT,
+                "poll_failure_grace_s": POLL_FAILURE_GRACE,
+            },
+            "history": [
+                {**entry, "at": _timestamp(entry["at"])} for entry in self._history
+            ],
+        }
 
     @callback
     def _check_alarm_events(self) -> None:
@@ -379,10 +810,41 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if len(self._event_log) > 20:
             self._event_log = self._event_log[-20:]
 
+    async def _login_for_command(self) -> None:
+        # The panel has one login shared by every client, and status polls keep working without
+        # ours. Since connecting, the app may have logged in as another user or the session may
+        # have lapsed, so commands would run under someone else's session or none.
+        try:
+            result = await self._conn.login(self._password)
+        except ConnectionError as err:
+            raise HomeAssistantError(
+                f"Could not log in to the alarm panel, so the command was not sent: {err}"
+            ) from err
+        if not result.logged_in:
+            raise HomeAssistantError(
+                "The alarm panel refused the login "
+                f"({_describe_panel_error(result.error)}), so the command was not sent"
+            )
+
     async def async_send_keypress(self, key_code: int, area_mask: int) -> None:
-        if not self._conn.connected:
-            raise ConnectionError("Not connected to panel")
-        await self._conn.send_keypress(key_code, area_mask)
+        # Not just the socket: an open socket without a logged-in session must not send keys.
+        if not self.connected:
+            raise ConnectionError(self._not_connected_message())
+        await self._login_for_command()
+        try:
+            result = await self._conn.send_keypress(key_code, area_mask)
+        except PanelNoResponseError as err:
+            # Sent once only: the ack may be what got lost, so re-read rather than resend.
+            await self.async_request_refresh()
+            raise HomeAssistantError(
+                "The alarm panel did not acknowledge the command. It may still have "
+                "been applied; check the alarm state before trying again."
+            ) from err
+        if result.error is not None:
+            raise HomeAssistantError(
+                "The alarm panel rejected the command "
+                f"({_describe_panel_error(result.error)})"
+            )
         await asyncio.sleep(0.5)
         await self.async_request_refresh()
 
@@ -397,12 +859,25 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.async_send_keypress(KEY_DISARM, area_mask)
 
     async def async_toggle_output(self, output_index: int) -> None:
-        if not self._conn.connected:
-            raise ConnectionError("Not connected to panel")
+        if not self.connected:
+            raise ConnectionError(self._not_connected_message())
         current = 0
         if output_index < len(self.rem_output_state):
             current = self.rem_output_state[output_index]
-        await self._conn.toggle_output(output_index, current)
+        await self._login_for_command()
+        try:
+            result = await self._conn.toggle_output(output_index, current)
+        except PanelNoResponseError as err:
+            await self.async_request_refresh()
+            raise HomeAssistantError(
+                "The alarm panel did not acknowledge the output change. It may still "
+                "have been applied; check the output state before trying again."
+            ) from err
+        if result.error is not None:
+            raise HomeAssistantError(
+                "The alarm panel rejected the output change "
+                f"({_describe_panel_error(result.error)})"
+            )
         await asyncio.sleep(0.3)
         r = await self._conn.query(
             QUERY_REM_OUTPUT_STATE, 1, self.max_rem_outputs + 1
@@ -412,6 +887,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.async_request_refresh()
 
     async def async_shutdown(self) -> None:
+        self._cancel_reconnect()
         await self._conn.disconnect()
         self._stage = 0
 
@@ -498,12 +974,15 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def keypad_subscribe(self, send_callback: Callable) -> Callable:
         self._keypad_subscribers += 1
         self._lcd_callbacks.append(send_callback)
+        self.update_interval = timedelta(seconds=KEYPAD_POLL_INTERVAL)
         send_callback(self._get_lcd_state())
 
         def unsubscribe() -> None:
             self._keypad_subscribers = max(0, self._keypad_subscribers - 1)
             if send_callback in self._lcd_callbacks:
                 self._lcd_callbacks.remove(send_callback)
+            if self._keypad_subscribers == 0:
+                self.update_interval = timedelta(seconds=POLL_INTERVAL)
 
         return unsubscribe
 
@@ -523,8 +1002,8 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("Error notifying LCD subscriber", exc_info=True)
 
     async def async_send_keypad_char(self, char: str) -> None:
-        if not self._conn.connected:
-            raise ConnectionError("Not connected to panel")
+        if not self.connected:
+            raise ConnectionError(self._not_connected_message())
         if len(char) != 1 or char not in self._VALID_KEYPAD_CHARS:
             raise ValueError(f"Invalid keypad character: {char!r}")
         await self._conn.send_keypad_char(char)

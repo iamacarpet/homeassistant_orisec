@@ -16,6 +16,10 @@ The protocol operates over UDP with two transport modes:
 
 This is the preferred mode for home automation integrations. The panel listens for UDP datagrams on port 20202 and responds to the same source address.
 
+**Several clients at once (tested on a CP20).** The panel answers requests from any IP and source port; none are refused. It keeps one destination for replies, though: whichever endpoint sent the most recent datagram. When a second client's request arrives while the panel is still handling the first (about 0.1 s), the first client's reply goes to the second client and the second request is dropped; if both arrive within ~10 ms, both are lost. Clients must therefore treat a missing reply as lost rather than late, and retry quickly. Login is panel-wide: once any client has logged in, status queries from every other endpoint are answered without a login of their own, and `CMD 3` (panel state) reports the logged-in user. With nobody logged in (e.g. after the IP module restarts), every query is answered with `CMD 99` error 4. The cloud relay path is separate.
+
+**Refusal lockout (seen twice on a CP20, cause unconfirmed).** The IP module can stop accepting UDP altogether: every datagram, from every IP and port, gets an ICMP port-unreachable. Once it lasted ~3.5 minutes and cleared by itself (refusals, then silence, then normal replies); once it lasted over 28 minutes and needed the IP module restarted. The first began with no test traffic at all; the second within a second of a test client closing its sockets. Attempts to reproduce it failed: replies sent to an already-closed client port (port-unreachable back to the panel), and an exact repeat of the traffic that preceded the second lockout, left the panel answering normally. The trigger is unknown, and no client-side behaviour is known to avoid it.
+
 ### Cloud Relay
 
 - **Port:** 15000
@@ -150,6 +154,7 @@ The full 256-entry CRC16 table is provided in `const.py`.
 
 **Error codes:**
 - `3` = Password failed
+- `4` = Not logged in (no client has a session)
 - `5` = Command not supported
 - `65503` = Authorisation key failed (cloud only)
 
@@ -452,11 +457,11 @@ The actual panel response is extracted from the server wrapper before being proc
 ## Practical Notes
 
 - **UDP packet size:** Keep request packets under ~200 bytes. The panel allocates a 200-byte buffer for requests.
-- **Response timing:** The panel typically responds within 10–50ms on LAN. Allow 3–5 seconds timeout for reliability.
+- **Response timing:** The panel typically responds within 0.1–0.3 s on LAN, including large multi-block queries. A reply that hasn't arrived within 1 s has usually gone to another client, so retry rather than wait longer.
 - **Settle time:** After receiving the first response datagram, wait ~200ms for any additional packets before processing.
 - **Polling interval:** The mobile app polls every ~2 seconds in normal operation. This is sufficient for near-real-time status updates.
 - **Zone name batching:** Request at most 15 zone names per query to avoid oversized response packets.
 - **Multi-command packets:** Combining multiple queries into a single packet reduces round trips. The panel responds with all requested data in a single response (or occasionally split across 2 datagrams).
 - **Area bitmask:** All area-related commands use a bitmask where bit N corresponds to area N+1. A panel with 2 areas uses bits 0 and 1 (mask `0x03`).
-- **No session tokens:** The protocol is stateless after login. Each polling packet stands alone — there is no session ID or sequence number.
+- **No session tokens:** The protocol is stateless after login. Each polling packet stands alone — there is no session ID or sequence number, and the login is shared by every client of the panel.
 - **Re-login:** If the panel stops responding (e.g., after a power cycle), simply re-send the login packet. There is no explicit "logout" command.
